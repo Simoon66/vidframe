@@ -1,0 +1,17 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+stream_cache/
+temp_uploads/
+uploads/
+public_subtitles/
+*.mkv
+*.mp4
+*.webm
+*.avi
+*.mov

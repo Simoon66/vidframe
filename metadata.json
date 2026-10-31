@@ -1,0 +1,8 @@
+{
+  "name": "VidFrame",
+  "description": "Mobile-First Video Hosting \u0026 Embed Player.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

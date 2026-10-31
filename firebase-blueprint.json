@@ -1,0 +1,89 @@
+{
+  "entities": {
+    "MediaItem": {
+      "title": "MediaItem",
+      "description": "Video media record stored in Telegram with metadata, intro/outro intervals, and playback settings",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "title": { "type": "string", "maxLength": 300 },
+        "description": { "type": "string", "maxLength": 5000 },
+        "filename": { "type": "string", "maxLength": 300 },
+        "mimeType": { "type": "string", "maxLength": 100 },
+        "size": { "type": "number" },
+        "duration": { "type": "number" },
+        "telegramChatId": { "type": "string", "maxLength": 100 },
+        "telegramMessageId": { "type": "number" },
+        "introStart": { "type": "number" },
+        "introEnd": { "type": "number" },
+        "outroStart": { "type": "number" },
+        "outroEnd": { "type": "number" },
+        "visibility": { "type": "string", "enum": ["public", "unlisted", "private"] },
+        "processingStatus": { "type": "string", "enum": ["ready", "processing", "failed"] },
+        "ownerId": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "title", "filename", "mimeType", "size", "telegramChatId", "telegramMessageId", "visibility", "processingStatus"]
+    },
+    "StorageConfig": {
+      "title": "StorageConfig",
+      "description": "Configured Telegram storage channel or group ID and access permissions",
+      "type": "object",
+      "properties": {
+        "chatId": { "type": "string", "maxLength": 100 },
+        "chatTitle": { "type": "string", "maxLength": 200 },
+        "canUpload": { "type": "boolean" },
+        "canRead": { "type": "boolean" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["chatId"]
+    },
+    "TelegramSession": {
+      "title": "TelegramSession",
+      "description": "Encrypted persistent Telegram MTProto GramJS session data",
+      "type": "object",
+      "properties": {
+        "encryptedSession": { "type": "string", "maxLength": 5000 },
+        "iv": { "type": "string", "maxLength": 100 },
+        "authTag": { "type": "string", "maxLength": 100 },
+        "phoneMasked": { "type": "string", "maxLength": 30 },
+        "userId": { "type": "string", "maxLength": 100 },
+        "username": { "type": "string", "maxLength": 100 },
+        "firstName": { "type": "string", "maxLength": 100 },
+        "connectedAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["encryptedSession", "iv", "authTag"]
+    },
+    "AdminRecord": {
+      "title": "AdminRecord",
+      "description": "Designated administrator identity record",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string", "format": "email", "maxLength": 200 },
+        "role": { "type": "string", "enum": ["admin"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["email", "role"]
+    }
+  },
+  "firestore": {
+    "/media/{mediaId}": {
+      "schema": "MediaItem",
+      "description": "Collection of uploaded video media metadata with stream references"
+    },
+    "/settings/storage": {
+      "schema": "StorageConfig",
+      "description": "Global storage configuration setting pointing to designated Telegram channel"
+    },
+    "/settings/telegram": {
+      "schema": "TelegramSession",
+      "description": "Encrypted server session for Telegram MTProto connection"
+    },
+    "/admins/{adminId}": {
+      "schema": "AdminRecord",
+      "description": "List of authorized administrator user IDs"
+    }
+  }
+}

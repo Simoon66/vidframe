@@ -1,0 +1,56 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // Media records: get allows single item by id; list allows querying collection; write allows mutations
+    match /media/{mediaId} {
+      allow get: if isValidId(mediaId);
+      allow list: if true;
+      allow write: if isValidId(mediaId);
+    }
+
+    // Series & Projects records
+    match /series/{seriesId} {
+      allow get: if isValidId(seriesId);
+      allow list: if true;
+      allow write: if isValidId(seriesId);
+    }
+
+    // Real-time analytics view events
+    match /views/{viewId} {
+      allow get: if isValidId(viewId);
+      allow list: if true;
+      allow write: if isValidId(viewId);
+    }
+
+    // User-submitted issue reports
+    match /reports/{reportId} {
+      allow get: if isValidId(reportId);
+      allow list: if true;
+      allow write: if isValidId(reportId);
+    }
+
+    // Server-managed settings (Telegram AES-256-GCM encrypted session and storage channel configuration)
+    match /settings/{settingId} {
+      allow get: if isValidId(settingId);
+      allow list: if true;
+      allow write: if isValidId(settingId);
+    }
+
+    // Admin records
+    match /admins/{adminId} {
+      allow get: if isValidId(adminId);
+      allow list: if true;
+      allow write: if isValidId(adminId);
+    }
+  }
+}
