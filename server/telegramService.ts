@@ -2,6 +2,7 @@ import { TelegramClient, Api } from 'telegram';
 import { StringSession } from 'telegram/sessions';
 import { computeCheck } from 'telegram/Password';
 import { MTProtoSender } from 'telegram/network';
+import { Logger, LogLevel } from 'telegram/extensions/Logger';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
@@ -16,7 +17,7 @@ import {
 import { encryptSession, decryptSession } from './crypto.ts';
 import { APP_CONFIG } from './config.ts';
 
-// Fix GramJS MTProtoSender.isConnected returning true even when TCP connection is closed.
+// Fix GramJS MTProtoSender.isConnected and guard un-awaited _reconnect() rejections.
 try {
   if (MTProtoSender && (MTProtoSender as any).prototype) {
     (MTProtoSender as any).prototype.isConnected = function () {
@@ -29,6 +30,22 @@ try {
             : this._connection._connected !== false)
       );
     };
+
+    const origReconnect = (MTProtoSender as any).prototype._reconnect;
+    if (typeof origReconnect === 'function') {
+      (MTProtoSender as any).prototype._reconnect = async function (...args: any[]) {
+        try {
+          return await origReconnect.apply(this, args);
+        } catch (err: any) {
+          this.isReconnecting = false;
+          const msg = String(err?.message || err || '');
+          if (!msg.includes('TIMEOUT')) {
+            console.warn('[TelegramService] Background MTProto reconnect notice:', msg);
+          }
+          return false;
+        }
+      };
+    }
   }
 } catch (patchErr) {
   console.warn('[TelegramService] Warning patching MTProtoSender:', patchErr);
@@ -114,6 +131,7 @@ export class TelegramService {
   private pendingAuth: PendingAuth | null = null;
   private isInitializing = false;
   private initPromise: Promise<void> | null = null;
+  private lastKeepaliveWarnAt = 0;
 
   private constructor() {}
 
@@ -122,6 +140,51 @@ export class TelegramService {
       TelegramService.instance = new TelegramService();
     }
     return TelegramService.instance;
+  }
+
+  private async safeDestroyClient(client: TelegramClient | null): Promise<void> {
+    if (!client) return;
+    try {
+      (client as any)._destroyed = true;
+      await withTimeout(client.destroy(), 3000, 'Destroy client timed out').catch(async () => {
+        try {
+          await client.disconnect();
+        } catch {}
+      });
+    } catch {}
+  }
+
+  private createConfiguredClient(session: StringSession, apiId: number, apiHash: string): TelegramClient {
+    // Silence GramJS internal _updateLoop console.error(new Error("TIMEOUT")) stderr dumps;
+    // route errors explicitly through onError so timeouts & auth revocations are handled cleanly.
+    const silentLogger = new Logger(LogLevel.NONE);
+    const client = new TelegramClient(session, apiId, apiHash, {
+      connectionRetries: 3,
+      retryDelay: 1500,
+      autoReconnect: true,
+      useWSS: false,
+      timeout: 10,
+      baseLogger: silentLogger,
+    });
+
+    client.onError = async (err: Error) => {
+      try {
+        if (isAuthFatalTelegramError(err)) {
+          if (this.state !== 'Login Required') {
+            await this.handleAuthFatalFailure(err).catch(() => {});
+          }
+          return;
+        }
+        const msg = String(err?.message || err || '');
+        const now = Date.now();
+        if (now - this.lastKeepaliveWarnAt > 30000) {
+          this.lastKeepaliveWarnAt = now;
+          console.warn(`[TelegramService] MTProto background notice: ${msg}`);
+        }
+      } catch {}
+    };
+
+    return client;
   }
 
   public getCredentials(): { apiId: number; apiHash: string; hasCredentials: boolean } {
@@ -234,10 +297,9 @@ export class TelegramService {
     };
 
     if (this.client) {
-      try {
-        await this.client.disconnect();
-      } catch {}
+      const clientToClose = this.client;
       this.client = null;
+      await this.safeDestroyClient(clientToClose);
     }
 
     // Preserve stored Firestore backup safely—ONLY update quarantine status metadata, NEVER delete the backup!
@@ -339,42 +401,52 @@ export class TelegramService {
         return;
       }
 
+      if (this.client) {
+        const oldClient = this.client;
+        this.client = null;
+        await this.safeDestroyClient(oldClient);
+      }
+
       const session = new StringSession(decryptedSession);
-      this.client = new TelegramClient(session, creds.apiId, creds.apiHash, {
-        connectionRetries: 5,
-        retryDelay: 2000,
-        autoReconnect: true,
-        useWSS: false,
-      });
+      const client = this.createConfiguredClient(session, creds.apiId, creds.apiHash);
+      this.client = client;
 
-      await withTimeout(this.client.connect(), 20000, 'Telegram connection timed out.');
+      try {
+        await withTimeout(client.connect(), 20000, 'Telegram connection timed out.');
 
-      const isAuthorized = await withTimeout(
-        this.client.checkAuthorization(),
-        15000,
-        'Telegram authorization check timed out.'
-      );
+        const isAuthorized = await withTimeout(
+          client.checkAuthorization(),
+          15000,
+          'Telegram authorization check timed out.'
+        );
 
-      if (isAuthorized) {
-        const me = await withTimeout(this.client.getMe(), 15000, 'Telegram getMe request timed out.');
-        this.currentUser = {
-          id: String((me as any).id),
-          username: (me as any).username || null,
-          firstName: (me as any).firstName || '',
-          lastName: (me as any).lastName || '',
-          phone: (me as any).phone || storedPhoneMasked || null,
-        };
-        this.state = 'Connected';
-        this.lastDiagnostic = null;
-        console.log(`[TelegramService] Restored session for user: ${this.currentUser.firstName} (${this.currentUser.id})`);
-      } else {
-        await this.handleAuthFatalFailure(new Error('AUTH_KEY_UNREGISTERED: Saved session is no longer authorized.'));
+        if (isAuthorized) {
+          const me = await withTimeout(client.getMe(), 15000, 'Telegram getMe request timed out.');
+          this.currentUser = {
+            id: String((me as any).id),
+            username: (me as any).username || null,
+            firstName: (me as any).firstName || '',
+            lastName: (me as any).lastName || '',
+            phone: (me as any).phone || storedPhoneMasked || null,
+          };
+          this.state = 'Connected';
+          this.lastDiagnostic = null;
+          console.log(`[TelegramService] Restored session for user: ${this.currentUser.firstName} (${this.currentUser.id})`);
+        } else {
+          await this.handleAuthFatalFailure(new Error('AUTH_KEY_UNREGISTERED: Saved session is no longer authorized.'));
+        }
+      } catch (connectErr: any) {
+        if (!isAuthFatalTelegramError(connectErr) && this.client === client) {
+          this.client = null;
+          await this.safeDestroyClient(client);
+        }
+        throw connectErr;
       }
     } catch (error: any) {
       if (isAuthFatalTelegramError(error)) {
         await this.handleAuthFatalFailure(error).catch(() => {});
       } else {
-        console.error('[TelegramService] Error initializing Telegram client:', error);
+        console.error('[TelegramService] Error initializing Telegram client:', error?.message || error);
         this.state = 'Connection Error';
         this.errorMessage = error?.message || 'Failed to connect to Telegram MTProto servers';
       }
@@ -491,32 +563,39 @@ export class TelegramService {
       this.lastDiagnostic = null;
 
       if (this.client) {
-        try {
-          await this.client.disconnect();
-        } catch {}
+        const oldClient = this.client;
+        this.client = null;
+        await this.safeDestroyClient(oldClient);
       }
 
       const session = new StringSession('');
-      this.client = new TelegramClient(session, creds.apiId, creds.apiHash, {
-        connectionRetries: 5,
-      });
+      const client = this.createConfiguredClient(session, creds.apiId, creds.apiHash);
+      this.client = client;
 
-      await withTimeout(this.client.connect(), 15000, 'Telegram connection timed out.');
+      try {
+        await withTimeout(client.connect(), 15000, 'Telegram connection timed out.');
 
-      const result = await withTimeout(
-        this.client.sendCode({ apiId: creds.apiId, apiHash: creds.apiHash }, cleanPhone),
-        20000,
-        'Telegram send code request timed out.'
-      );
+        const result = await withTimeout(
+          client.sendCode({ apiId: creds.apiId, apiHash: creds.apiHash }, cleanPhone),
+          20000,
+          'Telegram send code request timed out.'
+        );
 
-      this.pendingAuth = {
-        phoneNumber: cleanPhone,
-        phoneCodeHash: result.phoneCodeHash,
-        timestamp: Date.now(),
-      };
+        this.pendingAuth = {
+          phoneNumber: cleanPhone,
+          phoneCodeHash: result.phoneCodeHash,
+          timestamp: Date.now(),
+        };
 
-      this.state = 'Waiting for Code';
-      return { success: true, phoneCodeHash: result.phoneCodeHash };
+        this.state = 'Waiting for Code';
+        return { success: true, phoneCodeHash: result.phoneCodeHash };
+      } catch (err) {
+        if (this.client === client) {
+          this.client = null;
+        }
+        await this.safeDestroyClient(client);
+        throw err;
+      }
     } catch (error: any) {
       this.state = 'Connection Error';
       this.errorMessage = error?.message || 'Failed to send verification code.';
@@ -536,6 +615,9 @@ export class TelegramService {
 
     try {
       this.state = 'Connecting';
+      if (!this.isSocketConnected()) {
+        await withTimeout(this.client.connect(), 15000, 'Telegram connection timed out.');
+      }
       const user = await withTimeout(
         this.client.invoke(
           new Api.auth.SignIn({
@@ -567,6 +649,9 @@ export class TelegramService {
 
     try {
       this.state = 'Connecting';
+      if (!this.isSocketConnected()) {
+        await withTimeout(this.client.connect(), 15000, 'Telegram connection timed out.');
+      }
       const passwordSrpResult = await withTimeout(
         this.client.invoke(new Api.account.GetPassword()),
         15000,
@@ -636,9 +721,9 @@ export class TelegramService {
   public async disconnect(): Promise<void> {
     try {
       if (this.client) {
-        try {
-          await this.client.disconnect();
-        } catch {}
+        const oldClient = this.client;
+        this.client = null;
+        await this.safeDestroyClient(oldClient);
       }
     } finally {
       this.client = null;

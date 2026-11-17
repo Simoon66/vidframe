@@ -122,6 +122,7 @@ export async function restGetDoc<T = any>(docPath: string, token?: string): Prom
   const res = await fetch(url, {
     method: 'GET',
     headers: buildHeaders(token),
+    signal: AbortSignal.timeout(15000),
   });
   if (res.status === 404) return null;
   if (!res.ok) {
@@ -145,6 +146,7 @@ export async function restSetDoc(docPath: string, data: Record<string, any>, tok
     method: 'PATCH',
     headers: buildHeaders(token),
     body: JSON.stringify({ fields }),
+    signal: AbortSignal.timeout(15000),
   });
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
@@ -158,6 +160,7 @@ export async function restDeleteDoc(docPath: string, token?: string): Promise<vo
   const res = await fetch(url, {
     method: 'DELETE',
     headers: buildHeaders(token),
+    signal: AbortSignal.timeout(15000),
   });
   if (res.status === 404) return;
   if (!res.ok) {
@@ -243,6 +246,7 @@ export async function restListCollection<T = any>(
     method: 'POST',
     headers: buildHeaders(options.token),
     body: JSON.stringify({ structuredQuery }),
+    signal: AbortSignal.timeout(15000),
   });
 
   if (!res.ok) {
