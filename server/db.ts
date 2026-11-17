@@ -845,7 +845,10 @@ export async function listProcessingJobs(opts: { status?: string; limit?: number
       direction: 'DESCENDING',
       limit: lim,
     });
-  } catch {
+  } catch (err: any) {
+    if (err?.status === 401 || err?.status === 403 || String(err?.message || '').includes('(401)')) {
+      throw err;
+    }
     const all = await colList<ProcessingJobRecord>('processing_jobs', { limit: lim });
     const filtered = opts.status && opts.status !== 'all' ? all.filter((j) => j.status === opts.status) : all;
     return filtered.sort((a, b) => b.createdAt.localeCompare(a.createdAt));

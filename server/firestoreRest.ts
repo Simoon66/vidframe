@@ -12,15 +12,48 @@ export interface RequestAuthContext {
 
 const authStorage = new AsyncLocalStorage<RequestAuthContext>();
 
+export class FirestoreHttpError extends Error {
+  public readonly status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'FirestoreHttpError';
+    this.status = status;
+  }
+}
+
 // Stores most recent valid admin ID token for background async jobs spawned by an admin session in sandbox mode
 let latestAdminToken: { token: string; expMs: number } | null = null;
 
+function extractJwtExpMs(token: string): number {
+  try {
+    const parts = token.split('.');
+    if (parts.length === 3 && parts[1]) {
+      const decoded = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+      if (typeof decoded?.exp === 'number' && Number.isFinite(decoded.exp)) {
+        // Expire 60s before actual Firebase ID token expiry so we never send stale tokens
+        return decoded.exp * 1000 - 60_000;
+      }
+    }
+  } catch {}
+  return Date.now() + 10 * 60 * 1000;
+}
+
+export function clearCachedAdminToken(failedToken?: string): void {
+  if (!latestAdminToken) return;
+  if (!failedToken || latestAdminToken.token === failedToken) {
+    latestAdminToken = null;
+  }
+}
+
 export function runWithAuthContext<T>(ctx: RequestAuthContext, fn: () => T): T {
   if (ctx.idToken && ctx.role === 'admin') {
-    latestAdminToken = {
-      token: ctx.idToken,
-      expMs: Date.now() + 50 * 60 * 1000,
-    };
+    const expMs = extractJwtExpMs(ctx.idToken);
+    if (expMs > Date.now()) {
+      latestAdminToken = {
+        token: ctx.idToken,
+        expMs,
+      };
+    }
   }
   return authStorage.run(ctx, fn);
 }
@@ -32,8 +65,11 @@ export function getAuthContext(): RequestAuthContext | undefined {
 export function getEffectiveBearerToken(): string | undefined {
   const ctx = authStorage.getStore();
   if (ctx?.idToken) return ctx.idToken;
-  if (latestAdminToken && Date.now() < latestAdminToken.expMs) {
-    return latestAdminToken.token;
+  if (latestAdminToken) {
+    if (Date.now() < latestAdminToken.expMs) {
+      return latestAdminToken.token;
+    }
+    latestAdminToken = null;
   }
   return undefined;
 }
@@ -107,27 +143,29 @@ export function decodeDocument<T = any>(docJson: any): T | null {
   return out as T;
 }
 
-function buildHeaders(token?: string): Record<string, string> {
+function buildHeadersWithToken(token?: string): { headers: Record<string, string>; authToken?: string } {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   const authToken = token || getEffectiveBearerToken();
   if (authToken) {
     headers.Authorization = `Bearer ${authToken}`;
   }
-  return headers;
+  return { headers, authToken };
 }
 
 export async function restGetDoc<T = any>(docPath: string, token?: string): Promise<T | null> {
   const cleanPath = docPath.replace(/^\/+/, '');
   const url = `${getFirestoreBaseUrl()}/${cleanPath}`;
+  const { headers, authToken } = buildHeadersWithToken(token);
   const res = await fetch(url, {
     method: 'GET',
-    headers: buildHeaders(token),
+    headers,
     signal: AbortSignal.timeout(15000),
   });
   if (res.status === 404) return null;
   if (!res.ok) {
+    if (res.status === 401) clearCachedAdminToken(authToken);
     const errText = await res.text().catch(() => '');
-    throw new Error(`Firestore REST GET ${cleanPath} failed (${res.status}): ${errText}`);
+    throw new FirestoreHttpError(res.status, `Firestore REST GET ${cleanPath} failed (${res.status}): ${errText}`);
   }
   const json = await res.json();
   return decodeDocument<T>(json);
@@ -142,30 +180,34 @@ export async function restSetDoc(docPath: string, data: Record<string, any>, tok
       fields[k] = toFirestoreValue(v);
     }
   }
+  const { headers, authToken } = buildHeadersWithToken(token);
   const res = await fetch(url, {
     method: 'PATCH',
-    headers: buildHeaders(token),
+    headers,
     body: JSON.stringify({ fields }),
     signal: AbortSignal.timeout(15000),
   });
   if (!res.ok) {
+    if (res.status === 401) clearCachedAdminToken(authToken);
     const errText = await res.text().catch(() => '');
-    throw new Error(`Firestore REST PATCH ${cleanPath} failed (${res.status}): ${errText}`);
+    throw new FirestoreHttpError(res.status, `Firestore REST PATCH ${cleanPath} failed (${res.status}): ${errText}`);
   }
 }
 
 export async function restDeleteDoc(docPath: string, token?: string): Promise<void> {
   const cleanPath = docPath.replace(/^\/+/, '');
   const url = `${getFirestoreBaseUrl()}/${cleanPath}`;
+  const { headers, authToken } = buildHeadersWithToken(token);
   const res = await fetch(url, {
     method: 'DELETE',
-    headers: buildHeaders(token),
+    headers,
     signal: AbortSignal.timeout(15000),
   });
   if (res.status === 404) return;
   if (!res.ok) {
+    if (res.status === 401) clearCachedAdminToken(authToken);
     const errText = await res.text().catch(() => '');
-    throw new Error(`Firestore REST DELETE ${cleanPath} failed (${res.status}): ${errText}`);
+    throw new FirestoreHttpError(res.status, `Firestore REST DELETE ${cleanPath} failed (${res.status}): ${errText}`);
   }
 }
 
@@ -242,16 +284,18 @@ export async function restListCollection<T = any>(
     structuredQuery.limit = options.pageSize;
   }
 
+  const { headers, authToken } = buildHeadersWithToken(options.token);
   const res = await fetch(`${parentPath}:runQuery`, {
     method: 'POST',
-    headers: buildHeaders(options.token),
+    headers,
     body: JSON.stringify({ structuredQuery }),
     signal: AbortSignal.timeout(15000),
   });
 
   if (!res.ok) {
+    if (res.status === 401) clearCachedAdminToken(authToken);
     const errText = await res.text().catch(() => '');
-    throw new Error(`Firestore REST runQuery ${cleanCol} failed (${res.status}): ${errText}`);
+    throw new FirestoreHttpError(res.status, `Firestore REST runQuery ${cleanCol} failed (${res.status}): ${errText}`);
   }
 
   const rows = (await res.json()) as any[];

@@ -161,6 +161,16 @@ export default function App() {
       loadStatus();
       loadMedia();
       loadReports();
+
+      const refreshTimer = setInterval(async () => {
+        if (document.visibilityState === 'visible') {
+          try {
+            await user.getIdToken(true);
+            await loadStatus();
+          } catch {}
+        }
+      }, 35 * 60 * 1000);
+      return () => clearInterval(refreshTimer);
     }
   }, [user, loadStatus, loadMedia, loadReports]);
 

@@ -12,7 +12,7 @@ import {
   saveIntroSuggestion,
   SubtitleTrackMeta,
 } from '../db.ts';
-import { getEffectiveBearerToken } from '../firestoreRest.ts';
+import { getEffectiveBearerToken, clearCachedAdminToken } from '../firestoreRest.ts';
 import { JobQueueAdapter, EnqueueJobInput } from './types.ts';
 import { FirestoreJobQueueAdapter } from './firestoreQueueAdapter.ts';
 import { CloudTasksQueueAdapter, PubSubQueueAdapter } from './cloudQueueAdapters.ts';
@@ -107,6 +107,14 @@ class QueueManager {
       const job = await this.adapter.claimNext(WORKER_ID, 180000);
       if (!job) return;
       await this.executeJob(job);
+    } catch (err: any) {
+      const msg = String(err?.message || err || '');
+      if (err?.status === 401 || msg.includes('(401)') || msg.includes('UNAUTHENTICATED')) {
+        // Cached sandbox admin ID token expired; pause background polling silently until next authenticated admin request
+        clearCachedAdminToken();
+        return;
+      }
+      throw err;
     } finally {
       this.isProcessing = false;
       this.activeJobId = null;
