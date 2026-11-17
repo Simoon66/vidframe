@@ -32,6 +32,7 @@ export const TelegramConnect: React.FC<TelegramConnectProps> = ({
 
   // Loading & error states
   const [isLoading, setIsLoading] = useState(false);
+  const [confirmDisconnect, setConfirmDisconnect] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successNotice, setSuccessNotice] = useState<string | null>(null);
 
@@ -112,11 +113,8 @@ export const TelegramConnect: React.FC<TelegramConnectProps> = ({
 
   // Disconnect
   const handleDisconnect = async () => {
-    if (!confirm('Are you sure you want to disconnect your Telegram account and revoke the session?')) {
-      return;
-    }
-
     setIsLoading(true);
+    setConfirmDisconnect(false);
     setErrorMessage(null);
     try {
       await disconnectTelegram();
@@ -192,7 +190,9 @@ export const TelegramConnect: React.FC<TelegramConnectProps> = ({
             className={`text-xs px-3 py-1 rounded-full font-semibold border flex items-center gap-2 ${
               isConnected
                 ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
-                : state?.state === 'Connecting'
+                : state?.state === 'Login Required' || state?.state === 'Connection Error'
+                ? 'bg-red-500/10 text-red-400 border-red-500/30'
+                : state?.state === 'Connecting' || state?.state === 'Reconnecting'
                 ? 'bg-blue-500/10 text-blue-400 border-blue-500/30'
                 : isWaitingForCode || isWaitingFor2FA
                 ? 'bg-amber-500/10 text-amber-400 border-amber-500/30'
@@ -203,6 +203,8 @@ export const TelegramConnect: React.FC<TelegramConnectProps> = ({
               className={`w-2 h-2 rounded-full ${
                 isConnected
                   ? 'bg-emerald-500 animate-pulse'
+                  : state?.state === 'Login Required' || state?.state === 'Connection Error'
+                  ? 'bg-red-500'
                   : isWaitingForCode || isWaitingFor2FA
                   ? 'bg-amber-400 animate-pulse'
                   : 'bg-zinc-500'
@@ -213,18 +215,59 @@ export const TelegramConnect: React.FC<TelegramConnectProps> = ({
         </div>
       </div>
 
+      {/* Diagnostic Banner for Login Required / AUTH_KEY_UNREGISTERED / Destination Resolution */}
+      {(state?.state === 'Login Required' || state?.lastDiagnostic) && !isConnected && (
+        <div className="p-4 bg-red-950/35 border border-red-500/40 rounded-2xl text-xs space-y-2">
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-bold text-red-300">
+              {state?.state === 'Login Required'
+                ? 'Telegram Session Requires Re-Authorization (401 / AUTH_KEY_UNREGISTERED)'
+                : `MTProto Diagnostic (${state?.lastDiagnostic?.code})`}
+            </span>
+            {state?.lastDiagnostic?.failedAt && (
+              <span className="text-[10px] font-mono text-zinc-400">
+                {new Date(state.lastDiagnostic.failedAt).toLocaleString()}
+              </span>
+            )}
+          </div>
+          <p className="text-zinc-300 leading-relaxed">
+            {state?.lastDiagnostic?.message ||
+              state?.errorMessage ||
+              'The stored Telegram MTProto auth key was invalidated by Telegram or unregistered.'}
+          </p>
+          {state?.lastDiagnostic?.chatIdTried && (
+            <p className="text-[11px] font-mono text-zinc-400">
+              Channel/Peer Target Attempted: <span className="text-zinc-200">{state.lastDiagnostic.chatIdTried}</span>
+            </p>
+          )}
+          <p className="text-[11px] text-amber-300/90">
+            Your encrypted Firestore session backup has been preserved rather than wiped automatically. Sign in below with your phone number to issue a fresh MTProto session key, or click Retry Reconnect if transient.
+          </p>
+          <div>
+            <button
+              type="button"
+              onClick={handleReconnect}
+              disabled={isLoading}
+              className="px-3 py-1.5 bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg font-medium transition cursor-pointer"
+            >
+              Retry Socket Reconnect
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Notifications */}
       {successNotice && (
         <div className="p-3.5 bg-emerald-950/40 border border-emerald-500/30 rounded-xl text-emerald-300 text-xs flex items-center justify-between">
           <span>{successNotice}</span>
-          <button onClick={() => setSuccessNotice(null)} className="text-emerald-400 hover:text-emerald-200">✕</button>
+          <button onClick={() => setSuccessNotice(null)} className="text-emerald-400 hover:text-emerald-200 cursor-pointer">✕</button>
         </div>
       )}
 
       {errorMessage && (
         <div className="p-3.5 bg-red-950/40 border border-red-500/30 rounded-xl text-red-300 text-xs flex items-center justify-between">
           <span>{errorMessage}</span>
-          <button onClick={() => setErrorMessage(null)} className="text-red-400 hover:text-red-200">✕</button>
+          <button onClick={() => setErrorMessage(null)} className="text-red-400 hover:text-red-200 cursor-pointer">✕</button>
         </div>
       )}
 
@@ -287,13 +330,31 @@ export const TelegramConnect: React.FC<TelegramConnectProps> = ({
                 <span>Check / Reconnect Socket</span>
               </button>
 
-              <button
-                onClick={handleDisconnect}
-                disabled={isLoading}
-                className="w-full sm:w-auto px-3.5 py-2 bg-zinc-800 hover:bg-red-950/40 text-zinc-400 hover:text-red-400 border border-zinc-700/80 hover:border-red-800/60 rounded-xl text-xs font-medium transition cursor-pointer"
-              >
-                Disconnect
-              </button>
+              {!confirmDisconnect ? (
+                <button
+                  onClick={() => setConfirmDisconnect(true)}
+                  disabled={isLoading}
+                  className="w-full sm:w-auto px-3.5 py-2 bg-zinc-800 hover:bg-red-950/40 text-zinc-400 hover:text-red-400 border border-zinc-700/80 hover:border-red-800/60 rounded-xl text-xs font-medium transition cursor-pointer"
+                >
+                  Disconnect
+                </button>
+              ) : (
+                <div className="flex items-center gap-1.5">
+                  <button
+                    onClick={handleDisconnect}
+                    disabled={isLoading}
+                    className="px-3 py-2 bg-red-600 hover:bg-red-500 text-white rounded-xl text-xs font-semibold cursor-pointer"
+                  >
+                    Confirm Disconnect
+                  </button>
+                  <button
+                    onClick={() => setConfirmDisconnect(false)}
+                    className="px-2.5 py-2 bg-zinc-800 text-zinc-300 rounded-xl text-xs cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         </div>

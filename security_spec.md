@@ -1,22 +1,23 @@
-# Security Specification for FRAME
+# VidFrame Firestore Security Specification
 
 ## 1. Data Invariants
-1. A Media record cannot be modified or deleted by non-administrators.
-2. Sensitive Telegram session tokens and storage configurations cannot be accessed by public users or non-admins.
-3. Media documents with `visibility == 'public'` or `visibility == 'unlisted'` can be read for watch and embed playback.
-4. Updates to media metadata (intro/outro timestamps, title, description, visibility) can only be performed by authenticated admins.
-5. All IDs must strictly match `^[a-zA-Z0-9_\-]+$` and have length constraints.
+1. **Default Deny Catch-All**: Every path defaults to `allow read, write: if false;` unless explicitly granted below.
+2. **Verified Operator Identity**: No privileged read, list, create, update, or delete succeeds without `request.auth != null && request.auth.token.email_verified == true`.
+3. **No Secret / PII Exposure**: `/settings/*`, `/admins/*`, `/api_keys/*`, `/audit_logs/*`, `/processing_jobs/*`, and `/telemetry_metrics/*` are strictly inaccessible to unauthenticated or unprivileged users.
+4. **Private Media Protection**: Unauthenticated `get` on `/media/{mediaId}` is strictly limited to `visibility in ['public', 'unlisted']`. Collection `list` on `/media` is strictly restricted to verified admins/editors or matching `resource.data.ownerId == request.auth.uid`.
+5. **Immutable Audit & Master Lineage**: `/audit_logs/*` cannot be updated or deleted once created; `media_versions` and `media` preserve `createdAt` immutability across updates.
+6. **Bounded Resource Sizes & Regex IDs**: All document IDs (`isValidId`) match `^[a-zA-Z0-9_\-]+$` (max 128 chars), and all strings/arrays have explicit `.size()` ceilings.
 
-## 2. The "Dirty Dozen" Threat Scenarios
-1. **Unauthenticated Delete of Media**: Attacker sends DELETE to `/media/{id}` -> Expect PERMISSION_DENIED.
-2. **Unauthenticated Media Creation**: Attacker attempts to inject fake video record -> Expect PERMISSION_DENIED.
-3. **Session Theft**: Attacker tries to GET `/settings/telegram` -> Expect PERMISSION_DENIED.
-4. **Storage Hijacking**: Attacker tries to overwrite `/settings/storage` with their own chat ID -> Expect PERMISSION_DENIED.
-5. **Private Video Snooping**: Attacker attempts to GET a video where `visibility == 'private'` without admin auth -> Expect PERMISSION_DENIED.
-6. **Mass Media Scraping**: Attacker queries `/media` without authentication when private items exist -> Rules enforce only public/unlisted items or admin list.
-7. **Privilege Escalation**: Non-admin attempts to write to `/admins/{uid}` -> Expect PERMISSION_DENIED.
-8. **Field Injection (Shadow Update)**: User updates media with unauthorized ghost fields -> Expect PERMISSION_DENIED.
-9. **Timestamp Spoofing**: Client attempts to forge `createdAt` with arbitrary past date -> Handled via validation rules.
-10. **ID Poisoning**: Document ID with 2KB payload or directory traversal characters -> Rejected by `isValidId`.
-11. **Negative Intro/Outro Seek Injection**: Invalid numerical ranges -> Handled by schema and frontend validators.
-12. **MIME Spoofing / Malformed Data**: Payload with non-string title or non-number size -> Rejected by `isValidMediaItem`.
+## 2. The Dirty Dozen Malicious Payloads (All Must Yield PERMISSION_DENIED)
+1. **Unauthenticated Settings Read**: `GET /settings/telegram` without auth -> **DENIED**.
+2. **Unauthenticated Media List Scrape**: `LIST /media` without auth -> **DENIED**.
+3. **Unverified Admin Email Spoof**: Signed in with `simoonabdulla@gmail.com` where `email_verified == false` -> **DENIED**.
+4. **Privilege Self-Escalation**: Non-admin authenticated user writing `/admins/{uid}` with `role: 'admin'` -> **DENIED**.
+5. **Private Media Leak**: Unauthenticated `GET /media/{id}` where `resource.data.visibility == 'private'` -> **DENIED**.
+6. **ID Poisoning**: Creating `/media/../../etc/passwd` or 500-char ID -> **DENIED** by `isValidId`.
+7. **Shadow Ghost Field Injection**: Creating `/media/{id}` with extra `isSystemVerified: true` field -> **DENIED** by `hasOnly(...)` / schema validation.
+8. **Type Poisoning on Update**: Updating `/media/{id}` with `size: "huge"` or 50KB `title` -> **DENIED** by `isValidMediaItem(incoming())`.
+9. **Owner Hijack Update**: Updating `/media/{id}` modifying immutable `createdAt` -> **DENIED** by `incoming().createdAt == existing().createdAt`.
+10. **Audit Log Tampering**: Admin attempting `UPDATE` or `DELETE` on `/audit_logs/{logId}` -> **DENIED**.
+11. **API Key Secret Listing by Non-Admin**: Editor or Viewer calling `LIST /api_keys` -> **DENIED**.
+12. **Denial-of-Wallet Oversized Description/Report**: Submitting `/reports/{id}` with a 50,000-char `description` or invalid `status: 'resolved'` on create -> **DENIED**.

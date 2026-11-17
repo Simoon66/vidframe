@@ -1,11 +1,18 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { MediaItem, SystemStatus } from './types/media';
-import { fetchSystemStatus, fetchMediaItems, deleteMediaItem, fetchIssueReports } from './services/api';
+import {
+  fetchSystemStatus,
+  fetchMediaPaginated,
+  deleteMediaItem,
+  fetchIssueReports,
+} from './services/api';
 import { auth, googleProvider, signInWithPopup, signOut, onAuthStateChanged, User } from './services/firebase';
-import { Navbar } from './components/navigation/Navbar';
+import { Navbar, DashboardTab } from './components/navigation/Navbar';
 import { MediaLibrary } from './components/dashboard/MediaLibrary';
 import { SeriesManager } from './components/dashboard/SeriesManager';
+import { QueueMonitor } from './components/dashboard/QueueMonitor';
 import { ReportsManager } from './components/dashboard/ReportsManager';
+import { SecurityAndHealth } from './components/dashboard/SecurityAndHealth';
 import { SettingsHub } from './components/dashboard/SettingsHub';
 import { UploadModal } from './components/dashboard/UploadModal';
 import { EditMediaModal } from './components/dashboard/EditMediaModal';
@@ -14,20 +21,25 @@ import { WatchPage } from './components/watch/WatchPage';
 import { EmbedPage } from './components/embed/EmbedPage';
 import { AnalyticsDashboard } from './components/dashboard/AnalyticsDashboard';
 import { ToastProvider } from './components/common/Toast';
+import { ErrorBoundary } from './components/common/ErrorBoundary';
 
 export default function App() {
   const [currentPath, setCurrentPath] = useState<string>(window.location.pathname);
-  const [currentTab, setCurrentTab] = useState<'library' | 'series' | 'analytics' | 'reports' | 'settings'>('library');
+  const [currentTab, setCurrentTab] = useState<DashboardTab>('library');
   const [reportsCount, setReportsCount] = useState<number>(0);
 
   // Google Auth User State
   const [user, setUser] = useState<User | null>(null);
   const [isAuthChecking, setIsAuthChecking] = useState<boolean>(true);
+  const [authError, setAuthError] = useState<string | null>(null);
 
   // Data states
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   const [mediaItems, setMediaItems] = useState<MediaItem[]>([]);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [hasMoreMedia, setHasMoreMedia] = useState<boolean>(false);
   const [isLoadingMedia, setIsLoadingMedia] = useState<boolean>(true);
+  const [isLoadingMoreMedia, setIsLoadingMoreMedia] = useState<boolean>(false);
 
   // Modals state
   const [isUploadOpen, setIsUploadOpen] = useState(false);
@@ -55,32 +67,52 @@ export default function App() {
     setCurrentPath(path);
   };
 
-  // Route matches: /embed/:mediaId, /e/:source/:sourceId, or /e/:mediaId, or /watch/:mediaId
+  // Public / Player Routes
   const embedMatch = currentPath.match(/^\/embed\/([a-zA-Z0-9_\-]+)$/);
   if (embedMatch) {
-    return <EmbedPage mediaId={embedMatch[1]} />;
+    return (
+      <ErrorBoundary>
+        <EmbedPage mediaId={embedMatch[1]} />
+      </ErrorBoundary>
+    );
   }
 
   const embedSourceMatch = currentPath.match(/^\/e\/([a-z]+)\/([a-zA-Z0-9_\-]+)$/);
   if (embedSourceMatch) {
-    return <EmbedPage source={embedSourceMatch[1]} sourceId={embedSourceMatch[2]} />;
+    return (
+      <ErrorBoundary>
+        <EmbedPage source={embedSourceMatch[1]} sourceId={embedSourceMatch[2]} />
+      </ErrorBoundary>
+    );
   }
 
   const embedDirectMatch = currentPath.match(/^\/e\/([a-zA-Z0-9_\-]+)$/);
   if (embedDirectMatch) {
-    return <EmbedPage mediaId={embedDirectMatch[1]} />;
+    return (
+      <ErrorBoundary>
+        <EmbedPage mediaId={embedDirectMatch[1]} />
+      </ErrorBoundary>
+    );
   }
 
   const watchMatch = currentPath.match(/^\/watch\/([a-zA-Z0-9_\-]+)$/);
   if (watchMatch) {
-    return <WatchPage mediaId={watchMatch[1]} onNavigateHome={() => navigateTo('/')} />;
+    return (
+      <ErrorBoundary>
+        <WatchPage mediaId={watchMatch[1]} onNavigateHome={() => navigateTo('/')} />
+      </ErrorBoundary>
+    );
   }
 
   const loadStatus = useCallback(async () => {
     try {
       const status = await fetchSystemStatus();
       setSystemStatus(status);
-    } catch (e) {
+      setAuthError(null);
+    } catch (e: any) {
+      if (e?.message?.includes('401') || e?.message?.includes('status')) {
+        setAuthError(null);
+      }
       console.error('Failed to load system status:', e);
     }
   }, []);
@@ -88,8 +120,10 @@ export default function App() {
   const loadMedia = useCallback(async () => {
     setIsLoadingMedia(true);
     try {
-      const items = await fetchMediaItems();
-      setMediaItems(items);
+      const page = await fetchMediaPaginated({ limit: 24 });
+      setMediaItems(page.items);
+      setNextCursor(page.nextCursor);
+      setHasMoreMedia(page.hasMore);
     } catch (e) {
       console.error('Failed to load media items:', e);
     } finally {
@@ -97,13 +131,29 @@ export default function App() {
     }
   }, []);
 
+  const loadMoreMedia = useCallback(async () => {
+    if (!nextCursor || isLoadingMoreMedia) return;
+    setIsLoadingMoreMedia(true);
+    try {
+      const page = await fetchMediaPaginated({ limit: 24, cursor: nextCursor });
+      setMediaItems((prev) => {
+        const seen = new Set(prev.map((m) => m.id));
+        return [...prev, ...page.items.filter((m) => !seen.has(m.id))];
+      });
+      setNextCursor(page.nextCursor);
+      setHasMoreMedia(page.hasMore);
+    } catch (e) {
+      console.error('Failed to load more media:', e);
+    } finally {
+      setIsLoadingMoreMedia(false);
+    }
+  }, [nextCursor, isLoadingMoreMedia]);
+
   const loadReports = useCallback(async () => {
     try {
       const reports = await fetchIssueReports();
       setReportsCount(reports.filter((r) => r.status === 'open').length);
-    } catch {
-      // ignore
-    }
+    } catch {}
   }, []);
 
   useEffect(() => {
@@ -123,7 +173,6 @@ export default function App() {
     }
   };
 
-  // Auth checking loading screen
   if (isAuthChecking) {
     return (
       <div className="w-screen h-screen bg-[#0a0a0c] flex items-center justify-center">
@@ -132,7 +181,7 @@ export default function App() {
     );
   }
 
-  // Google Login Gate
+  // Zero-Leak Google Login Gate (never exposes admin email pre-auth)
   if (!user) {
     return (
       <div className="w-screen h-screen bg-[#0a0a0c] text-white flex flex-col items-center justify-center p-4">
@@ -143,16 +192,23 @@ export default function App() {
           <div className="space-y-2">
             <h1 className="text-2xl font-bold tracking-tight">VidFrame Admin Portal</h1>
             <p className="text-xs text-zinc-400">
-              Sign in with your authorized administrator account to access VidFrame.
+              Sign in with your authorized administrator or editor Google account to access VidFrame.
             </p>
           </div>
 
+          {authError && (
+            <div className="p-3 bg-red-950/40 border border-red-500/30 rounded-xl text-red-300 text-xs">
+              {authError}
+            </div>
+          )}
+
           <button
             onClick={async () => {
+              setAuthError(null);
               try {
                 await signInWithPopup(auth, googleProvider);
               } catch (err: any) {
-                alert(err.message || 'Google sign-in failed');
+                setAuthError(err?.message || 'Google sign-in failed.');
               }
             }}
             className="w-full py-3 bg-red-600 hover:bg-red-500 text-white rounded-xl text-xs font-semibold shadow-xl shadow-red-950/50 transition cursor-pointer flex items-center justify-center gap-2.5"
@@ -168,102 +224,116 @@ export default function App() {
   const folders = Array.from(new Set(mediaItems.map((m) => m.folder).filter(Boolean))) as string[];
 
   return (
-    <ToastProvider>
-      <div className="min-h-screen bg-[#0a0a0c] text-zinc-100 flex flex-col font-sans selection:bg-red-600/30 selection:text-red-200">
-      <Navbar
-        currentTab={currentTab}
-        onSelectTab={setCurrentTab}
-        telegramState={systemStatus?.telegram || null}
-        onOpenUpload={() => setIsUploadOpen(true)}
-        reportsCount={reportsCount}
-      />
-
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6 sm:py-8">
-        {currentTab === 'library' && (
-          <MediaLibrary
-            mediaItems={mediaItems}
-            isLoading={isLoadingMedia}
-            onRefresh={loadMedia}
+    <ErrorBoundary>
+      <ToastProvider>
+        <div className="min-h-screen bg-[#0a0a0c] text-zinc-100 flex flex-col font-sans selection:bg-red-600/30 selection:text-red-200">
+          <Navbar
+            currentTab={currentTab}
+            onSelectTab={setCurrentTab}
+            telegramState={systemStatus?.telegram || null}
+            storageConfig={systemStatus?.storage || null}
             onOpenUpload={() => setIsUploadOpen(true)}
-            onOpenEdit={(item) => setEditingMedia(item)}
-            onOpenPreview={(item) => {
-              setPreviewMedia(item);
+            reportsCount={reportsCount}
+          />
+
+          <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6 sm:py-8">
+            {currentTab === 'library' && (
+              <MediaLibrary
+                mediaItems={mediaItems}
+                isLoading={isLoadingMedia}
+                isLoadingMore={isLoadingMoreMedia}
+                hasMore={hasMoreMedia}
+                onLoadMore={loadMoreMedia}
+                onRefresh={loadMedia}
+                onOpenUpload={() => setIsUploadOpen(true)}
+                onOpenEdit={(item) => setEditingMedia(item)}
+                onOpenPreview={(item) => {
+                  setPreviewMedia(item);
+                  setIsPreviewDemo(false);
+                }}
+                onDeleteMedia={handleDeleteMedia}
+                folders={folders}
+                onBatchUpdated={loadMedia}
+              />
+            )}
+
+            {currentTab === 'series' && <SeriesManager mediaItems={mediaItems} onRefresh={loadMedia} />}
+
+            {currentTab === 'queue' && <QueueMonitor />}
+
+            {currentTab === 'analytics' && <AnalyticsDashboard mediaItems={mediaItems} />}
+
+            {currentTab === 'reports' && <ReportsManager />}
+
+            {currentTab === 'health' && <SecurityAndHealth />}
+
+            {currentTab === 'settings' && (
+              <SettingsHub
+                status={systemStatus}
+                onRefresh={loadStatus}
+                onOpenPreviewDemo={() => {
+                  setPreviewMedia(null);
+                  setIsPreviewDemo(true);
+                }}
+              />
+            )}
+          </main>
+
+          <UploadModal
+            isOpen={isUploadOpen}
+            onClose={() => setIsUploadOpen(false)}
+            onSuccess={(newMedia) => {
+              if (Array.isArray(newMedia)) {
+                setMediaItems((prev) => [...newMedia, ...prev]);
+              } else {
+                setMediaItems((prev) => [newMedia, ...prev]);
+              }
+            }}
+            telegramState={systemStatus?.telegram || null}
+            storageConfig={systemStatus?.storage || null}
+            onGoToTelegram={() => setCurrentTab('settings')}
+            onGoToStorage={() => setCurrentTab('settings')}
+          />
+
+          <EditMediaModal
+            media={editingMedia}
+            isOpen={Boolean(editingMedia)}
+            onClose={() => setEditingMedia(null)}
+            onSaved={(updated) => {
+              setMediaItems((prev) => prev.map((m) => (m.id === updated.id ? updated : m)));
+              setEditingMedia((prev) => (prev && prev.id === updated.id ? updated : prev));
+            }}
+          />
+
+          <PreviewModal
+            media={previewMedia}
+            isOpen={Boolean(previewMedia) || isPreviewDemo}
+            isDemo={isPreviewDemo}
+            onClose={() => {
+              setPreviewMedia(null);
               setIsPreviewDemo(false);
             }}
-            onDeleteMedia={handleDeleteMedia}
-            folders={folders}
-            onBatchUpdated={loadMedia}
           />
-        )}
 
-        {currentTab === 'series' && (
-          <SeriesManager
-            mediaItems={mediaItems}
-            onRefresh={loadMedia}
-          />
-        )}
-
-        {currentTab === 'analytics' && <AnalyticsDashboard mediaItems={mediaItems} />}
-
-        {currentTab === 'reports' && <ReportsManager />}
-
-        {currentTab === 'settings' && (
-          <SettingsHub
-            status={systemStatus}
-            onRefresh={loadStatus}
-            onOpenPreviewDemo={() => {
-              setPreviewMedia(null);
-              setIsPreviewDemo(true);
-            }}
-          />
-        )}
-      </main>
-
-      <UploadModal
-        isOpen={isUploadOpen}
-        onClose={() => setIsUploadOpen(false)}
-        onSuccess={(newMedia) => {
-          if (Array.isArray(newMedia)) {
-            setMediaItems((prev) => [...newMedia, ...prev]);
-          } else {
-            setMediaItems((prev) => [newMedia, ...prev]);
-          }
-        }}
-        telegramState={systemStatus?.telegram || null}
-        storageConfig={systemStatus?.storage || null}
-        onGoToTelegram={() => setCurrentTab('settings')}
-        onGoToStorage={() => setCurrentTab('settings')}
-      />
-
-      <EditMediaModal
-        media={editingMedia}
-        isOpen={Boolean(editingMedia)}
-        onClose={() => setEditingMedia(null)}
-        onSaved={(updated) => {
-          setMediaItems((prev) => prev.map((m) => (m.id === updated.id ? updated : m)));
-        }}
-      />
-
-      <PreviewModal
-        media={previewMedia}
-        isOpen={Boolean(previewMedia) || isPreviewDemo}
-        isDemo={isPreviewDemo}
-        onClose={() => {
-          setPreviewMedia(null);
-          setIsPreviewDemo(false);
-        }}
-      />
-
-      <footer className="border-t border-zinc-900 py-6 px-4 text-center text-xs text-zinc-600">
-        <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-3">
-          <div className="flex items-center gap-2">
-            <span className="font-bold text-zinc-400">VidFrame</span>
-            <span>• Telegram-Powered Video Hosting & Embed Cloud</span>
-          </div>
-          <div>Secure Cloud Streaming Infrastructure • Authorized Administrator Session</div>
+          <footer className="border-t border-zinc-900 py-6 px-4 text-center text-xs text-zinc-600">
+            <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <span className="font-bold text-zinc-400">VidFrame</span>
+                <span>• Scalable Video CDN & Media Infrastructure</span>
+              </div>
+              <div className="flex items-center gap-3">
+                <span>{user.email}</span>
+                <button
+                  onClick={() => signOut(auth)}
+                  className="text-zinc-400 hover:text-white underline cursor-pointer"
+                >
+                  Sign Out
+                </button>
+              </div>
+            </div>
+          </footer>
         </div>
-      </footer>
-    </div>
-    </ToastProvider>
+      </ToastProvider>
+    </ErrorBoundary>
   );
 }

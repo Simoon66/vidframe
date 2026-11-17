@@ -6,6 +6,9 @@ import { useToast } from '../common/Toast';
 interface MediaLibraryProps {
   mediaItems: MediaItem[];
   isLoading: boolean;
+  isLoadingMore?: boolean;
+  hasMore?: boolean;
+  onLoadMore?: () => void;
   onRefresh: () => void;
   onOpenUpload: () => void;
   onOpenEdit: (item: MediaItem) => void;
@@ -18,6 +21,9 @@ interface MediaLibraryProps {
 export const MediaLibrary: React.FC<MediaLibraryProps> = ({
   mediaItems,
   isLoading,
+  isLoadingMore = false,
+  hasMore = false,
+  onLoadMore,
   onRefresh,
   onOpenUpload,
   onOpenEdit,
@@ -29,6 +35,7 @@ export const MediaLibrary: React.FC<MediaLibraryProps> = ({
   const toast = useToast();
   const [searchQuery, setSearchQuery] = useState('');
   const [filterVisibility, setFilterVisibility] = useState<string>('all');
+  const [filterStatus, setFilterStatus] = useState<string>('all');
   const [selectedFolderFilter, setSelectedFolderFilter] = useState<string>('all');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [moveToFolderInput, setMoveToFolderInput] = useState('');
@@ -46,15 +53,16 @@ export const MediaLibrary: React.FC<MediaLibraryProps> = ({
         item.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
         item.filename.toLowerCase().includes(searchQuery.toLowerCase());
       const matchesVis = filterVisibility === 'all' || item.visibility === filterVisibility;
+      const matchesStatus = filterStatus === 'all' || item.processingStatus === filterStatus;
       const matchesFolder =
         selectedFolderFilter === 'all'
           ? true
           : selectedFolderFilter === 'unfiled'
           ? !item.folder
           : item.folder === selectedFolderFilter;
-      return matchesSearch && matchesVis && matchesFolder;
+      return matchesSearch && matchesVis && matchesStatus && matchesFolder;
     });
-  }, [mediaItems, searchQuery, filterVisibility, selectedFolderFilter]);
+  }, [mediaItems, searchQuery, filterVisibility, filterStatus, selectedFolderFilter]);
 
   const toggleSelectAll = () => {
     if (selectedIds.size === filteredItems.length) {
@@ -227,6 +235,17 @@ export const MediaLibrary: React.FC<MediaLibraryProps> = ({
               <option value="private">Private</option>
             </select>
 
+            <select
+              value={filterStatus}
+              onChange={(e) => setFilterStatus(e.target.value)}
+              className="bg-zinc-900 border border-zinc-800 text-zinc-300 text-xs rounded-xl px-3 py-2 focus:outline-none focus:border-red-500/80 transition cursor-pointer"
+            >
+              <option value="all">All Status</option>
+              <option value="ready">Ready</option>
+              <option value="processing">Processing</option>
+              <option value="failed">Failed</option>
+            </select>
+
             <button
               onClick={onRefresh}
               className="p-2 bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-zinc-400 hover:text-white rounded-xl transition cursor-pointer"
@@ -352,8 +371,8 @@ export const MediaLibrary: React.FC<MediaLibraryProps> = ({
                     </h4>
                   </div>
 
-                  {/* Folder & Visibility Badges */}
-                  <div className="flex flex-wrap items-center gap-2 mb-2">
+                  {/* Folder, HLS & Status Badges */}
+                  <div className="flex flex-wrap items-center gap-1.5 mb-2">
                     <span
                       className={`text-[10px] px-2 py-0.5 rounded-full uppercase tracking-wider font-mono font-semibold border ${
                         item.visibility === 'public'
@@ -365,6 +384,26 @@ export const MediaLibrary: React.FC<MediaLibraryProps> = ({
                     >
                       {item.visibility}
                     </span>
+                    <span
+                      className={`text-[10px] px-2 py-0.5 rounded-full uppercase font-mono border ${
+                        item.playbackMode === 'hls_v2'
+                          ? 'bg-red-500/10 text-red-300 border-red-500/30'
+                          : 'bg-zinc-800 text-zinc-400 border-zinc-700'
+                      }`}
+                    >
+                      {item.playbackMode === 'hls_v2' ? 'HLS ABR' : item.storageBackend || 'telegram'}
+                    </span>
+                    {item.processingStatus !== 'ready' && (
+                      <span
+                        className={`text-[10px] px-2 py-0.5 rounded-full uppercase font-mono border ${
+                          item.processingStatus === 'processing'
+                            ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
+                            : 'bg-red-500/10 text-red-400 border-red-500/30'
+                        }`}
+                      >
+                        {item.processingStatus}
+                      </span>
+                    )}
                     {item.folder && (
                       <span className="text-[10px] px-2 py-0.5 rounded-full bg-zinc-800 text-zinc-300 border border-zinc-700 font-mono">
                         📁 {item.folder}
@@ -377,12 +416,18 @@ export const MediaLibrary: React.FC<MediaLibraryProps> = ({
                     <p className="truncate font-mono text-zinc-500" title={item.filename}>
                       {item.filename}
                     </p>
-                    <div className="flex items-center gap-3 text-zinc-400">
+                    <div className="flex items-center gap-2.5 text-zinc-400 font-mono text-[10px]">
                       <span>{formatFileSize(item.size)}</span>
                       <span>•</span>
                       <span>{formatDuration(item.duration)}</span>
                       <span>•</span>
-                      <span className="text-[10px] uppercase">{item.mimeType.split('/')[1] || 'video'}</span>
+                      <span className="uppercase">{item.mimeType.split('/')[1] || 'video'}</span>
+                      {item.sha256Hash && (
+                        <>
+                          <span>•</span>
+                          <span title={item.sha256Hash}>sha256:{item.sha256Hash.slice(0, 8)}</span>
+                        </>
+                      )}
                     </div>
                   </div>
 
@@ -466,6 +511,26 @@ export const MediaLibrary: React.FC<MediaLibraryProps> = ({
               </div>
             );
           })}
+        </div>
+      )}
+
+      {/* Cursor Pagination Footer */}
+      {hasMore && onLoadMore && (
+        <div className="flex justify-center pt-2">
+          <button
+            onClick={onLoadMore}
+            disabled={isLoadingMore}
+            className="px-6 py-2.5 bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-xl text-xs font-semibold transition cursor-pointer disabled:opacity-50 flex items-center gap-2"
+          >
+            {isLoadingMore ? (
+              <>
+                <div className="w-3.5 h-3.5 rounded-full border-2 border-zinc-400/30 border-t-white animate-spin" />
+                <span>Loading next page...</span>
+              </>
+            ) : (
+              <span>Load More Videos</span>
+            )}
+          </button>
         </div>
       )}
 

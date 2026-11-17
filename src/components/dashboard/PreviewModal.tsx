@@ -1,5 +1,6 @@
-import React from 'react';
-import { MediaItem } from '../../types/media';
+import React, { useEffect, useState } from 'react';
+import { MediaItem, PlaybackDescriptor } from '../../types/media';
+import { fetchPlaybackDescriptor } from '../../services/api';
 import { VideoPlayer } from '../player/VideoPlayer';
 
 interface PreviewModalProps {
@@ -15,11 +16,30 @@ export const PreviewModal: React.FC<PreviewModalProps> = ({
   onClose,
   isDemo = false,
 }) => {
+  const [descriptor, setDescriptor] = useState<PlaybackDescriptor | null>(null);
+
+  useEffect(() => {
+    if (!isOpen || isDemo || !media) {
+      setDescriptor(null);
+      return;
+    }
+    let mounted = true;
+    fetchPlaybackDescriptor(media.id)
+      .then((desc) => {
+        if (mounted) setDescriptor(desc);
+      })
+      .catch(() => {
+        if (mounted) setDescriptor(null);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, [isOpen, isDemo, media]);
+
   if (!isOpen) return null;
 
-  // If demo preview, provide a public high quality sample clip with sample intro/outro times
   const demoVideoUrl = 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4';
-  const src = isDemo || !media ? demoVideoUrl : `/api/media/${media.id}/stream`;
+  const src = isDemo || !media ? demoVideoUrl : descriptor?.legacyStreamUrl || `/api/media/${media.id}/stream`;
   const title = isDemo || !media ? 'Demo Video — Skip Intro & Outro Testing' : media.title;
   const introStart = isDemo || !media ? 5 : media.introStart;
   const introEnd = isDemo || !media ? 15 : media.introEnd;
@@ -32,11 +52,15 @@ export const PreviewModal: React.FC<PreviewModalProps> = ({
         className="relative w-full max-w-4xl bg-zinc-950 border border-zinc-800 rounded-2xl overflow-hidden shadow-2xl flex flex-col my-auto"
         onClick={(e) => e.stopPropagation()}
       >
-        {/* Header */}
         <div className="p-3 sm:p-4 bg-zinc-900/80 border-b border-zinc-800 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <div className="w-2.5 h-2.5 rounded-full bg-red-600 animate-pulse" />
             <h3 className="text-xs sm:text-sm font-semibold text-white truncate max-w-md">{title}</h3>
+            {descriptor?.playbackMode === 'hls_v2' && (
+              <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-red-600/20 text-red-300 border border-red-500/30">
+                HLS ABR
+              </span>
+            )}
           </div>
           <button
             onClick={onClose}
@@ -47,29 +71,32 @@ export const PreviewModal: React.FC<PreviewModalProps> = ({
           </button>
         </div>
 
-        {/* Video Player */}
         <div className="w-full bg-black">
           <VideoPlayer
             src={src}
+            hlsSrc={isDemo ? undefined : descriptor?.hlsManifestUrl}
+            poster={isDemo ? undefined : descriptor?.posterUrl}
             mediaId={media?.id}
             title={title}
             introStart={introStart}
             introEnd={introEnd}
             outroStart={outroStart}
             outroEnd={outroEnd}
+            audioTracks={descriptor?.audioTracks}
+            subtitleTracks={descriptor?.subtitleTracks}
+            chapters={descriptor?.chapters || media?.chapters}
             autoPlay={true}
           />
         </div>
 
-        {/* Footer info */}
         <div className="p-3.5 bg-zinc-950 text-xs text-zinc-400 flex flex-wrap items-center justify-between gap-3 border-t border-zinc-900">
           <div className="flex items-center gap-3 text-[11px] font-mono">
-            <span>Intro skip test: {introStart}s–{introEnd}s</span>
+            <span>Intro skip: {introStart || 0}s–{introEnd || 0}s</span>
             <span>•</span>
-            <span>Outro skip test: {outroStart}s–{outroEnd}s</span>
+            <span>Outro skip: {outroStart || 0}s–{outroEnd || 0}s</span>
           </div>
           <span className="text-[11px] text-zinc-500">
-            Press Space to Play/Pause, ←/→ for 10s seeking, F for Fullscreen
+            Click to Play/Pause • Double-tap left/right to seek 10s
           </span>
         </div>
       </div>

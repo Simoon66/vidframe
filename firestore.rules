@@ -2,55 +2,377 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Default deny
+    // 1. Default Deny Global Catch-All
     match /{document=**} {
       allow read, write: if false;
+    }
+
+    // 2. Global Security Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isPrimaryAdmin() {
+      return isVerifiedUser() && request.auth.token.email == 'simoonabdulla@gmail.com';
+    }
+
+    function isAdmin() {
+      return isPrimaryAdmin() || (
+        isVerifiedUser() &&
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.active == true
+      );
+    }
+
+    function isFullAdmin() {
+      return isPrimaryAdmin() || (
+        isVerifiedUser() &&
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.active == true &&
+        get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role == 'admin'
+      );
     }
 
     function isValidId(id) {
       return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
-    // Media records: get allows single item by id; list allows querying collection; write allows mutations
-    match /media/{mediaId} {
-      allow get: if isValidId(mediaId);
-      allow list: if true;
-      allow write: if isValidId(mediaId);
+    function incoming() {
+      return request.resource.data;
     }
 
-    // Series & Projects records
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidDateString(val) {
+      return val is string && val.size() > 0 && val.size() <= 64;
+    }
+
+    // 3. Entity Validation Blueprints
+    function isValidMediaItem(data) {
+      return data.keys().hasAll(['id', 'title', 'filename', 'mimeType', 'size', 'visibility', 'processingStatus', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'id', 'title', 'description', 'filename', 'mimeType', 'size', 'duration',
+          'telegramChatId', 'telegramMessageId', 'telegramMessageIds',
+          'introStart', 'introEnd', 'outroStart', 'outroEnd',
+          'visibility', 'processingStatus', 'folder', 'views', 'ownerId',
+          'tenantId', 'tenantShard', 'timeBucket', 'playbackMode', 'storageBackend',
+          'activeVersionId', 'sha256Hash', 'allowedDomains', 'requireSignedPlayback',
+          'posterUrl', 'storyboardUrl', 'chapters', 'audioTracks', 'subtitleTracks',
+          'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && data.title is string && data.title.size() > 0 && data.title.size() <= 300
+        && data.filename is string && data.filename.size() > 0 && data.filename.size() <= 300
+        && data.mimeType is string && data.mimeType.size() > 0 && data.mimeType.size() <= 120
+        && data.size is number && data.size >= 0
+        && data.visibility in ['public', 'unlisted', 'private']
+        && data.processingStatus in ['ready', 'processing', 'failed']
+        && (!('description' in data) || (data.description is string && data.description.size() <= 5000))
+        && (!('folder' in data) || (data.folder is string && data.folder.size() <= 120))
+        && (!('ownerId' in data) || (data.ownerId is string && data.ownerId.size() <= 128))
+        && (!('audioTracks' in data) || (data.audioTracks is list && data.audioTracks.size() <= 32))
+        && (!('subtitleTracks' in data) || (data.subtitleTracks is list && data.subtitleTracks.size() <= 64))
+        && (!('chapters' in data) || (data.chapters is list && data.chapters.size() <= 100))
+        && (!('allowedDomains' in data) || (data.allowedDomains is list && data.allowedDomains.size() <= 20))
+        && isValidDateString(data.createdAt)
+        && isValidDateString(data.updatedAt);
+    }
+
+    function isValidMediaVersion(data) {
+      return data.keys().hasAll(['id', 'mediaId', 'versionNumber', 'storageBackend', 'objectPrefix', 'status', 'createdBy', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'id', 'mediaId', 'versionNumber', 'label', 'filename', 'mimeType', 'size',
+          'duration', 'sha256Hash', 'storageBackend', 'objectPrefix', 'masterPlaylistKey',
+          'posterKey', 'storyboardKey', 'renditions', 'probeMetadata', 'audioTracks',
+          'subtitleTracks', 'telegramChatId', 'telegramMessageId', 'telegramMessageIds',
+          'status', 'error', 'createdBy', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && isValidId(data.mediaId)
+        && data.versionNumber is number && data.versionNumber >= 1
+        && data.storageBackend in ['telegram', 's3_r2', 'local_dev']
+        && data.objectPrefix is string && data.objectPrefix.size() > 0 && data.objectPrefix.size() <= 300
+        && data.status in ['queued', 'processing', 'ready', 'failed']
+        && data.createdBy is string && data.createdBy.size() > 0 && data.createdBy.size() <= 128
+        && (!('renditions' in data) || (data.renditions is list && data.renditions.size() <= 12))
+        && (!('error' in data) || (data.error is string && data.error.size() <= 2000))
+        && isValidDateString(data.createdAt)
+        && isValidDateString(data.updatedAt);
+    }
+
+    function isValidProcessingJob(data) {
+      return data.keys().hasAll(['id', 'idempotencyKey', 'mediaId', 'jobType', 'status', 'attempts', 'maxAttempts', 'createdBy', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'id', 'idempotencyKey', 'queueShard', 'mediaId', 'versionId', 'jobType', 'status',
+          'priority', 'attempts', 'maxAttempts', 'checkpoint', 'progressPercent',
+          'statusMessage', 'leaseOwner', 'leaseExpiresAt', 'heartbeatAt', 'cancelRequested',
+          'payload', 'result', 'error', 'createdBy', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && isValidId(data.mediaId)
+        && data.idempotencyKey is string && data.idempotencyKey.size() > 0 && data.idempotencyKey.size() <= 200
+        && data.jobType in ['transcode_hls', 'extract_tracks', 'ai_transcribe', 'ai_translate', 'detect_intro', 'import_url']
+        && data.status in ['queued', 'running', 'completed', 'failed', 'dead_letter', 'cancelled']
+        && data.attempts is number && data.attempts >= 0
+        && data.maxAttempts is number && data.maxAttempts >= 1
+        && data.createdBy is string && data.createdBy.size() > 0 && data.createdBy.size() <= 128
+        && (!('error' in data) || (data.error is string && data.error.size() <= 2000))
+        && isValidDateString(data.createdAt)
+        && isValidDateString(data.updatedAt);
+    }
+
+    function isValidIntroSuggestion(data) {
+      return data.keys().hasAll(['id', 'mediaId', 'status', 'provider', 'createdBy', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'id', 'mediaId', 'introStart', 'introEnd', 'outroStart', 'outroEnd',
+          'chapters', 'confidenceNote', 'provider', 'status', 'createdBy', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && isValidId(data.mediaId)
+        && data.status in ['pending', 'approved', 'rejected']
+        && data.provider is string && data.provider.size() > 0 && data.provider.size() <= 64
+        && data.createdBy is string && data.createdBy.size() > 0 && data.createdBy.size() <= 128
+        && (!('chapters' in data) || (data.chapters is list && data.chapters.size() <= 100))
+        && isValidDateString(data.createdAt)
+        && isValidDateString(data.updatedAt);
+    }
+
+    function isValidAdminRecord(data) {
+      return data.keys().hasAll(['uid', 'email', 'role', 'active', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'role', 'active', 'displayName', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid)
+        && data.email is string && data.email.size() > 3 && data.email.size() <= 200
+        && data.role in ['admin', 'editor']
+        && data.active is bool
+        && (!('displayName' in data) || (data.displayName is string && data.displayName.size() <= 120))
+        && isValidDateString(data.createdAt)
+        && isValidDateString(data.updatedAt);
+    }
+
+    function isValidApiKey(data) {
+      return data.keys().hasAll(['id', 'name', 'keyPrefix', 'keyHash', 'role', 'ownerUid', 'createdAt'])
+        && data.keys().hasOnly(['id', 'name', 'keyPrefix', 'keyHash', 'scopes', 'role', 'ownerUid', 'revokedAt', 'lastUsedAt', 'expiresAt', 'createdAt'])
+        && isValidId(data.id)
+        && data.name is string && data.name.size() > 0 && data.name.size() <= 100
+        && data.keyPrefix is string && data.keyPrefix.size() > 0 && data.keyPrefix.size() <= 40
+        && data.keyHash is string && data.keyHash.size() == 64
+        && data.role in ['admin', 'editor', 'playback']
+        && data.ownerUid is string && data.ownerUid.size() > 0 && data.ownerUid.size() <= 128
+        && (!('scopes' in data) || (data.scopes is list && data.scopes.size() <= 20))
+        && isValidDateString(data.createdAt);
+    }
+
+    function isValidAuditLog(data) {
+      return data.keys().hasAll(['id', 'actorUid', 'actorEmail', 'actorRole', 'action', 'resourceType', 'resourceId', 'createdAt'])
+        && data.keys().hasOnly(['id', 'actorUid', 'actorEmail', 'actorRole', 'action', 'resourceType', 'resourceId', 'details', 'ip', 'createdAt'])
+        && isValidId(data.id)
+        && data.actorUid is string && data.actorUid.size() > 0 && data.actorUid.size() <= 128
+        && data.actorEmail is string && data.actorEmail.size() > 0 && data.actorEmail.size() <= 200
+        && data.action is string && data.action.size() > 0 && data.action.size() <= 120
+        && data.resourceType is string && data.resourceType.size() > 0 && data.resourceType.size() <= 64
+        && data.resourceId is string && data.resourceId.size() > 0 && data.resourceId.size() <= 128
+        && isValidDateString(data.createdAt);
+    }
+
+    function isValidSeries(data) {
+      return data.keys().hasAll(['id', 'source', 'sourceId', 'title', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'source', 'sourceId', 'title', 'japaneseTitle', 'description', 'coverImage', 'bannerImage', 'logoImage', 'seasons', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && data.source in ['iddb', 'tmdb', 'anilist', 'mal', 'custom']
+        && data.sourceId is string && data.sourceId.size() > 0 && data.sourceId.size() <= 128
+        && data.title is string && data.title.size() > 0 && data.title.size() <= 300
+        && (!('description' in data) || (data.description is string && data.description.size() <= 5000))
+        && (!('seasons' in data) || (data.seasons is list && data.seasons.size() <= 100))
+        && isValidDateString(data.createdAt)
+        && isValidDateString(data.updatedAt);
+    }
+
+    function isValidReport(data) {
+      return data.keys().hasAll(['id', 'issueType', 'status', 'createdAt'])
+        && data.keys().hasOnly(['id', 'mediaId', 'mediaTitle', 'issueType', 'description', 'status', 'createdAt'])
+        && isValidId(data.id)
+        && data.issueType in ['Video not playing', 'Audio issue', 'Subtitle issue', 'Buffering or slow playback', 'other']
+        && data.status in ['open', 'investigating', 'resolved']
+        && (!('mediaId' in data) || (data.mediaId is string && data.mediaId.size() <= 128))
+        && (!('mediaTitle' in data) || (data.mediaTitle is string && data.mediaTitle.size() <= 300))
+        && (!('description' in data) || (data.description is string && data.description.size() <= 2000))
+        && isValidDateString(data.createdAt);
+    }
+
+    function isValidViewEvent(data) {
+      return data.keys().hasAll(['id', 'mediaId', 'timestamp', 'country', 'device', 'os', 'browser'])
+        && data.keys().hasOnly(['id', 'mediaId', 'mediaTitle', 'timestamp', 'country', 'device', 'os', 'browser', 'ip'])
+        && isValidId(data.id)
+        && isValidId(data.mediaId)
+        && isValidDateString(data.timestamp)
+        && data.country is string && data.country.size() > 0 && data.country.size() <= 80
+        && data.device in ['Mobile', 'Desktop', 'Tablet', 'Other']
+        && data.os in ['Windows', 'Android', 'iOS', 'macOS', 'Linux', 'Other']
+        && data.browser is string && data.browser.size() > 0 && data.browser.size() <= 64;
+    }
+
+    // 4. Health & Connectivity Probe Doc
+    match /test/connection {
+      allow get: if true;
+    }
+
+    // 5. Media Catalog & Sharded View Counters
+    match /media/{mediaId} {
+      allow get: if isValidId(mediaId) && (
+        existing().visibility in ['public', 'unlisted'] ||
+        isAdmin() ||
+        (isVerifiedUser() && existing().ownerId == request.auth.uid)
+      );
+      allow list: if isPrimaryAdmin() || (isVerifiedUser() && resource.data.ownerId == request.auth.uid);
+      allow create: if isValidId(mediaId) && isAdmin() && isValidMediaItem(incoming());
+      allow update: if isValidId(mediaId) && isAdmin() && isValidMediaItem(incoming())
+        && incoming().id == existing().id
+        && incoming().createdAt == existing().createdAt;
+      allow delete: if isValidId(mediaId) && isAdmin();
+
+      match /view_shards/{shardId} {
+        allow get: if isValidId(mediaId) && isValidId(shardId) && (
+          get(/databases/$(database)/documents/media/$(mediaId)).data.visibility in ['public', 'unlisted'] || isAdmin()
+        );
+        allow list: if isPrimaryAdmin() || (
+          isVerifiedUser() &&
+          resource.data.count >= 0
+        );
+        allow create, update: if isValidId(mediaId) && isValidId(shardId)
+          && exists(/databases/$(database)/documents/media/$(mediaId))
+          && incoming().keys().hasAll(['count', 'updatedAt'])
+          && incoming().keys().hasOnly(['count', 'updatedAt'])
+          && incoming().count is number && incoming().count >= 0
+          && isValidDateString(incoming().updatedAt);
+        allow delete: if isValidId(mediaId) && isValidId(shardId) && isAdmin();
+      }
+    }
+
+    // 6. Immutable Master Versions
+    match /media_versions/{versionId} {
+      allow get: if isValidId(versionId) && (
+        isAdmin() ||
+        get(/databases/$(database)/documents/media/$(existing().mediaId)).data.visibility in ['public', 'unlisted']
+      );
+      allow list: if isPrimaryAdmin() || (isVerifiedUser() && resource.data.createdBy == request.auth.uid);
+      allow create: if isValidId(versionId) && isAdmin() && isValidMediaVersion(incoming())
+        && exists(/databases/$(database)/documents/media/$(incoming().mediaId));
+      allow update: if isValidId(versionId) && isAdmin() && isValidMediaVersion(incoming())
+        && incoming().id == existing().id
+        && incoming().mediaId == existing().mediaId
+        && incoming().createdAt == existing().createdAt;
+      allow delete: if isValidId(versionId) && isAdmin();
+    }
+
+    // 7. Durable Processing Jobs
+    match /processing_jobs/{jobId} {
+      allow get: if isValidId(jobId) && isAdmin();
+      allow list: if isPrimaryAdmin() || (isVerifiedUser() && resource.data.createdBy == request.auth.uid);
+      allow create: if isValidId(jobId) && isAdmin() && isValidProcessingJob(incoming());
+      allow update: if isValidId(jobId) && isAdmin() && isValidProcessingJob(incoming())
+        && incoming().id == existing().id
+        && incoming().createdAt == existing().createdAt;
+      allow delete: if isValidId(jobId) && isFullAdmin();
+    }
+
+    // 8. AI Intro / Chapter Suggestions
+    match /intro_suggestions/{suggestionId} {
+      allow get: if isValidId(suggestionId) && isAdmin();
+      allow list: if isPrimaryAdmin() || (isVerifiedUser() && resource.data.createdBy == request.auth.uid);
+      allow create: if isValidId(suggestionId) && isAdmin() && isValidIntroSuggestion(incoming());
+      allow update: if isValidId(suggestionId) && isAdmin() && isValidIntroSuggestion(incoming())
+        && incoming().id == existing().id
+        && incoming().createdAt == existing().createdAt;
+      allow delete: if isValidId(suggestionId) && isAdmin();
+    }
+
+    // 9. Sensitive System Settings (Encrypted Telegram Session & S3 Credentials - Admin Only)
+    match /settings/{settingId} {
+      allow get: if isValidId(settingId) && isAdmin();
+      allow list: if isPrimaryAdmin();
+      allow create, update: if isValidId(settingId) && isFullAdmin() && isValidDateString(incoming().updatedAt);
+      allow delete: if isValidId(settingId) && isFullAdmin();
+    }
+
+    // 10. RBAC Admin Directory (PII Isolated - Self or Full Admin Only)
+    match /admins/{adminId} {
+      allow get: if isValidId(adminId) && (isFullAdmin() || (isVerifiedUser() && request.auth.uid == adminId));
+      allow list: if isPrimaryAdmin();
+      allow create: if isValidId(adminId) && isFullAdmin() && isValidAdminRecord(incoming());
+      allow update: if isValidId(adminId) && isFullAdmin() && isValidAdminRecord(incoming())
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt;
+      allow delete: if isValidId(adminId) && isFullAdmin() && adminId != request.auth.uid;
+    }
+
+    // 11. Programmatic API Keys (Full Admin Only)
+    match /api_keys/{keyId} {
+      allow get: if isValidId(keyId) && isFullAdmin();
+      allow list: if isPrimaryAdmin();
+      allow create: if isValidId(keyId) && isFullAdmin() && isValidApiKey(incoming());
+      allow update: if isValidId(keyId) && isFullAdmin() && isValidApiKey(incoming())
+        && incoming().id == existing().id
+        && incoming().keyHash == existing().keyHash
+        && incoming().createdAt == existing().createdAt;
+      allow delete: if isValidId(keyId) && isFullAdmin();
+    }
+
+    // 12. Immutable Audit Logs (Append-Only by Operators; No Updates or Deletes)
+    match /audit_logs/{logId} {
+      allow get: if isValidId(logId) && isAdmin();
+      allow list: if isPrimaryAdmin();
+      allow create: if isValidId(logId) && isAdmin() && isValidAuditLog(incoming());
+      allow update, delete: if false;
+    }
+
+    // 13. Telemetry Samples
+    match /telemetry_metrics/{sampleId} {
+      allow get: if isValidId(sampleId) && isAdmin();
+      allow list: if isPrimaryAdmin();
+      allow create: if isValidId(sampleId) && isAdmin()
+        && incoming().keys().hasAll(['id', 'kind', 'routeOrMediaId', 'createdAt'])
+        && isValidId(incoming().id)
+        && isValidDateString(incoming().createdAt);
+      allow update, delete: if isValidId(sampleId) && isFullAdmin();
+    }
+
+    // 14. Series & Collections
     match /series/{seriesId} {
       allow get: if isValidId(seriesId);
-      allow list: if true;
-      allow write: if isValidId(seriesId);
+      allow list: if isPrimaryAdmin();
+      allow create: if isValidId(seriesId) && isAdmin() && isValidSeries(incoming());
+      allow update: if isValidId(seriesId) && isAdmin() && isValidSeries(incoming())
+        && incoming().id == existing().id
+        && incoming().createdAt == existing().createdAt;
+      allow delete: if isValidId(seriesId) && isAdmin();
     }
 
-    // Real-time analytics view events
+    // 15. Analytics View Events
     match /views/{viewId} {
-      allow get: if isValidId(viewId);
-      allow list: if true;
-      allow write: if isValidId(viewId);
+      allow get: if isValidId(viewId) && isAdmin();
+      allow list: if isPrimaryAdmin();
+      allow create: if isValidId(viewId) && isValidViewEvent(incoming())
+        && exists(/databases/$(database)/documents/media/$(incoming().mediaId));
+      allow update: if false;
+      allow delete: if isValidId(viewId) && isAdmin();
     }
 
-    // User-submitted issue reports
+    // 16. Viewer Issue Reports
     match /reports/{reportId} {
-      allow get: if isValidId(reportId);
-      allow list: if true;
-      allow write: if isValidId(reportId);
-    }
-
-    // Server-managed settings (Telegram AES-256-GCM encrypted session and storage channel configuration)
-    match /settings/{settingId} {
-      allow get: if isValidId(settingId);
-      allow list: if true;
-      allow write: if isValidId(settingId);
-    }
-
-    // Admin records
-    match /admins/{adminId} {
-      allow get: if isValidId(adminId);
-      allow list: if true;
-      allow write: if isValidId(adminId);
+      allow get: if isValidId(reportId) && isAdmin();
+      allow list: if isPrimaryAdmin();
+      allow create: if isValidId(reportId) && isValidReport(incoming())
+        && incoming().status == 'open';
+      allow update: if isValidId(reportId) && isAdmin() && isValidReport(incoming())
+        && incoming().diff(existing()).affectedKeys().hasOnly(['status'])
+        && incoming().createdAt == existing().createdAt;
+      allow delete: if isValidId(reportId) && isAdmin();
     }
   }
 }

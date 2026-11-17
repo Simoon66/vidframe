@@ -1,11 +1,12 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { APP_CONFIG } from './config.ts';
 
 const KEY_FILE = path.resolve(process.cwd(), '.telegram_key');
 
-// Get project-specific permanent deterministic seed from firebase-applet-config.json
-function getProjectDeterministicSeed(): string {
+// Legacy deterministic seed (only used for decrypting historical records during rotation)
+function getLegacyDeterministicSeed(): string {
   try {
     const configPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
     if (fs.existsSync(configPath)) {
@@ -14,9 +15,7 @@ function getProjectDeterministicSeed(): string {
         return `${config.projectId}:${config.appId}:vidframe-permanent-secure-salt-2026`;
       }
     }
-  } catch {
-    // ignore
-  }
+  } catch {}
   return 'vidframe-permanent-default-master-key-seed-2026';
 }
 
@@ -29,33 +28,30 @@ export function getPrimaryEncryptionKey(): Buffer {
     return crypto.createHash('sha256').update(envKey.trim()).digest();
   }
 
-  // Persistent file key
   if (fs.existsSync(KEY_FILE)) {
     try {
       const saved = fs.readFileSync(KEY_FILE, 'utf8').trim();
       if (/^[0-9a-fA-F]{64}$/.test(saved)) {
         return Buffer.from(saved, 'hex');
       }
-    } catch {
-      // ignore
-    }
+    } catch {}
   }
 
-  // Deterministic fallback based on immutable project configuration
-  const seed = getProjectDeterministicSeed();
-  const deterministicKey = crypto.createHash('sha256').update(seed).digest();
+  // Generate strong random 256-bit local key (do not write static predictable seeds for new secrets in prod)
+  if (APP_CONFIG.isProduction) {
+    console.warn('[Crypto] TELEGRAM_SESSION_ENCRYPTION_KEY not set in production! Configure Secret Manager.');
+  }
 
+  const randomKey = crypto.randomBytes(32);
   try {
-    fs.writeFileSync(KEY_FILE, deterministicKey.toString('hex'), 'utf8');
-  } catch {
-    // ignore
-  }
-  return deterministicKey;
+    fs.writeFileSync(KEY_FILE, randomKey.toString('hex'), { encoding: 'utf8', mode: 0o600 });
+  } catch {}
+  return randomKey;
 }
 
 export function encryptSession(plainText: string): { encryptedSession: string; iv: string; authTag: string } {
   const key = getPrimaryEncryptionKey();
-  const iv = crypto.randomBytes(12); // Standard 12-byte IV for AES-GCM
+  const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
 
   let encrypted = cipher.update(plainText, 'utf8', 'hex');
@@ -69,32 +65,29 @@ export function encryptSession(plainText: string): { encryptedSession: string; i
   };
 }
 
-export function decryptSession(encryptedHex: string, ivHex: string, authTagHex: string): string {
-  // If plain string session was somehow passed
+export function decryptSession(encryptedHex: string, ivHex: string, authTagHex: string): {
+  session: string;
+  usedLegacyKey: boolean;
+} {
   if (encryptedHex.startsWith('1Ap') || encryptedHex.startsWith('1B')) {
-    return encryptedHex;
+    return { session: encryptedHex, usedLegacyKey: true };
   }
 
-  const keysToTry: Buffer[] = [];
+  const primaryKey = getPrimaryEncryptionKey();
+  const primaryHex = primaryKey.toString('hex');
+  const keysToTry: Buffer[] = [primaryKey];
 
-  // 1. Primary key & key file
-  keysToTry.push(getPrimaryEncryptionKey());
-
-  // 2. Deterministic project seed key
-  const seed = getProjectDeterministicSeed();
-  keysToTry.push(crypto.createHash('sha256').update(seed).digest());
-
-  // 3. Known key stored in file if any
-  try {
-    if (fs.existsSync(KEY_FILE)) {
+  if (fs.existsSync(KEY_FILE)) {
+    try {
       const saved = fs.readFileSync(KEY_FILE, 'utf8').trim();
       if (/^[0-9a-fA-F]{64}$/.test(saved)) {
         keysToTry.push(Buffer.from(saved, 'hex'));
       }
-    }
-  } catch {}
+    } catch {}
+  }
 
-  // 4. Fallback project-derived seeds
+  // Key-rotation compatibility chain for existing saved Telegram sessions
+  keysToTry.push(crypto.createHash('sha256').update(getLegacyDeterministicSeed()).digest());
   try {
     const configPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
     if (fs.existsSync(configPath)) {
@@ -105,21 +98,14 @@ export function decryptSession(encryptedHex: string, ivHex: string, authTagHex: 
       if (cfg.appId) keysToTry.push(crypto.createHash('sha256').update(cfg.appId).digest());
     }
   } catch {}
-
-  // 5. Historical seeds
   keysToTry.push(Buffer.from('2f098bc8fde9967bb8be7b7bfc6f0fd368a8ee5a64e2f54497bae26fb244dae4', 'hex'));
   keysToTry.push(crypto.createHash('sha256').update('vidframe-permanent-default-master-key-seed-2026').digest());
   keysToTry.push(crypto.createHash('sha256').update('telegram-session-secret-key-2026').digest());
-
-  if (process.env.TELEGRAM_SESSION_ENCRYPTION_KEY) {
-    keysToTry.push(crypto.createHash('sha256').update(process.env.TELEGRAM_SESSION_ENCRYPTION_KEY.trim()).digest());
-  }
 
   const iv = Buffer.from(ivHex, 'hex');
   const authTag = Buffer.from(authTagHex, 'hex');
 
   let lastError: any = null;
-  // Deduplicate keys by hex string
   const seenHex = new Set<string>();
   for (const key of keysToTry) {
     const keyHex = key.toString('hex');
@@ -132,7 +118,10 @@ export function decryptSession(encryptedHex: string, ivHex: string, authTagHex: 
       let decrypted = decipher.update(encryptedHex, 'hex', 'utf8');
       decrypted += decipher.final('utf8');
       if (decrypted && decrypted.length > 0) {
-        return decrypted;
+        return {
+          session: decrypted,
+          usedLegacyKey: keyHex !== primaryHex,
+        };
       }
     } catch (e) {
       lastError = e;
@@ -140,4 +129,39 @@ export function decryptSession(encryptedHex: string, ivHex: string, authTagHex: 
   }
 
   throw lastError || new Error('Unable to decrypt session data with any known keys.');
+}
+
+export function encryptJsonSecret(data: unknown): { ciphertext: string; iv: string; authTag: string } {
+  const res = encryptSession(JSON.stringify(data));
+  return { ciphertext: res.encryptedSession, iv: res.iv, authTag: res.authTag };
+}
+
+export function decryptJsonSecret<T = any>(ciphertext: string, iv: string, authTag: string): T {
+  const { session } = decryptSession(ciphertext, iv, authTag);
+  return JSON.parse(session) as T;
+}
+
+export function sha256Hex(input: string | Buffer): string {
+  return crypto.createHash('sha256').update(input).digest('hex');
+}
+
+export function computeFileSha256(filePath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    const stream = fs.createReadStream(filePath);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+    stream.on('error', reject);
+  });
+}
+
+export function hmacSha256Base64Url(secret: string, payload: string): string {
+  return crypto.createHmac('sha256', secret).update(payload).digest('base64url');
+}
+
+export function timingSafeEqualStr(a: string, b: string): boolean {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
 }

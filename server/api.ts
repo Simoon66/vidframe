@@ -7,10 +7,14 @@ import { spawn, spawnSync } from 'node:child_process';
 import { TelegramService } from './telegramService.ts';
 import {
   getMediaItems,
+  listMediaPaginated,
+  findMediaBySha256,
   getMediaItem,
   saveMediaItem,
   updateMediaItem,
   deleteMediaItem,
+  saveMediaVersion,
+  incrementShardedView,
   getStorageConfig,
   getSeriesItems,
   getSeriesItem,
@@ -23,14 +27,37 @@ import {
   updateReportStatus,
   deleteReport,
   MediaRecord,
+  MediaVersionRecord,
   SeriesRecord,
   AnalyticsEvent,
   ReportRecord,
 } from './db.ts';
+import { getFirebaseConfig } from './config.ts';
+import { computeFileSha256 } from './crypto.ts';
+import { requireAuth, attachOptionalAuth, recordAudit } from './middleware/auth.ts';
+import { rateLimit } from './middleware/rateLimit.ts';
+import { telemetryMiddleware } from './observability/telemetry.ts';
+import { safeProbeMediaUrl, safeDownloadUrlToTempFile } from './security/ssrfGuard.ts';
+import { verifySignedPlaybackToken, getCdnCacheHeaders } from './security/signedUrls.ts';
+import { getStorageAdapter, sanitizeStorageConfigForClient } from './storage/storageRouter.ts';
+import { probeMediaFull, applyWebVttOffset } from './workers/mediaPipeline.ts';
+import { queueManager } from './queue/queueManager.ts';
+import { listAvailableAiProviders } from './ai/externalProviders.ts';
+import { cdnRouter } from './routes/cdnRoutes.ts';
+import { controlPlaneRouter } from './routes/controlPlaneRoutes.ts';
 
 export const apiRouter = express.Router();
 apiRouter.use(express.json({ limit: '100mb' }));
 apiRouter.use(express.urlencoded({ extended: true, limit: '100mb' }));
+apiRouter.use(telemetryMiddleware);
+apiRouter.use(attachOptionalAuth);
+
+// Mount Control Plane & Signed HLS CDN routes
+apiRouter.use(cdnRouter);
+apiRouter.use(controlPlaneRouter);
+
+// Start background worker loop for durable HLS / AI / chapter jobs
+queueManager.startWorkerLoop();
 
 // Setup multer upload directory and video cache directories
 const uploadDir = path.resolve(process.cwd(), 'temp_uploads');
@@ -257,29 +284,101 @@ export async function ensureRemuxedMp4(media: MediaRecord, audioIndex: number): 
   return promise;
 }
 
-// Immediate post-upload helper: caches MKV raw locally and immediately starts track 0 remux
-async function handleMkvPostUpload(filePath: string, media: MediaRecord): Promise<void> {
-  const isMkv =
-    (media.mimeType && (media.mimeType.toLowerCase().includes('matroska') || media.mimeType.toLowerCase().includes('mkv'))) ||
-    (media.filename && media.filename.toLowerCase().endsWith('.mkv'));
-
-  if (!isMkv) return;
-
-  const rawPath = path.join(streamCacheDir, `raw_${media.id}.mkv`);
+// Immediate post-upload helper: registers master version v1, caches raw source locally if needed, and queues HLS packaging
+async function stageUploadVersionAndQueueHls(
+  filePath: string,
+  media: MediaRecord,
+  createdBy: string,
+  preferredBackend?: 'telegram' | 's3_r2' | 'local_dev'
+): Promise<void> {
   try {
-    if (fs.existsSync(filePath) && (!fs.existsSync(rawPath) || fs.statSync(rawPath).size === 0)) {
-      fs.copyFileSync(filePath, rawPath);
+    const versionId = `ver_${Date.now()}_${crypto.randomBytes(2).toString('hex')}`;
+    const objectPrefix = `media/${media.id}/${versionId}`;
+    const sha256Hash = fs.existsSync(filePath) ? await computeFileSha256(filePath) : media.sha256Hash || '';
+    let probe: ReturnType<typeof probeMediaFull> | null = null;
+    try {
+      probe = probeMediaFull(filePath);
+    } catch {}
+
+    const backend = preferredBackend || media.storageBackend || 'telegram';
+
+    if (backend === 'telegram') {
+      // Cache raw locally when MKV or multi-track so stream & worker immediately have source
+      const streamSourcePath = path.join(streamCacheDir, `source_${media.id}_${versionId}.mkv`);
+      if (fs.existsSync(filePath) && !fs.existsSync(streamSourcePath)) {
+        fs.copyFileSync(filePath, streamSourcePath);
+      }
+      const isMkv =
+        (media.mimeType && (media.mimeType.toLowerCase().includes('matroska') || media.mimeType.toLowerCase().includes('mkv'))) ||
+        (media.filename && media.filename.toLowerCase().endsWith('.mkv'));
+      if (isMkv) {
+        const rawPath = path.join(streamCacheDir, `raw_${media.id}.mkv`);
+        if (fs.existsSync(filePath) && (!fs.existsSync(rawPath) || fs.statSync(rawPath).size === 0)) {
+          fs.copyFileSync(filePath, rawPath);
+        }
+        const { audioTracks, subtitleTracks } = probeFileTracks(rawPath, media.id);
+        if (audioTracks.length > 0 || subtitleTracks.length > 0) {
+          media.audioTracks = audioTracks;
+          media.subtitleTracks = subtitleTracks;
+          await updateMediaItem(media.id, { audioTracks, subtitleTracks });
+        }
+        ensureRemuxedMp4(media, 0).catch((err) => console.warn('[Background Remux Notice]:', err));
+      }
     }
-    const { audioTracks, subtitleTracks } = probeFileTracks(rawPath, media.id);
-    if (audioTracks.length > 0 || subtitleTracks.length > 0) {
-      media.audioTracks = audioTracks;
-      media.subtitleTracks = subtitleTracks;
-      await updateMediaItem(media.id, { audioTracks, subtitleTracks });
-    }
-    // Kick off track 0 remuxing asynchronously so it's ready in seconds
-    ensureRemuxedMp4(media, 0).catch((err) => console.warn('[Background Remux Notice]:', err));
+
+    const now = new Date().toISOString();
+    const versionRecord: MediaVersionRecord = {
+      id: versionId,
+      mediaId: media.id,
+      versionNumber: 1,
+      label: 'v1 Initial Master',
+      filename: media.filename,
+      mimeType: media.mimeType,
+      size: media.size,
+      duration: probe?.duration || media.duration || 0,
+      sha256Hash,
+      storageBackend: backend,
+      objectPrefix,
+      renditions: [],
+      probeMetadata: probe
+        ? {
+            width: probe.width,
+            height: probe.height,
+            fps: probe.fps,
+            videoCodec: probe.videoCodec,
+            audioCodec: probe.audioCodec,
+            bitrate: probe.bitrate,
+          }
+        : undefined,
+      audioTracks: probe?.audioTracks || media.audioTracks,
+      telegramChatId: media.telegramChatId || undefined,
+      telegramMessageId: media.telegramMessageId || undefined,
+      telegramMessageIds: media.telegramMessageIds,
+      status: 'queued',
+      createdBy,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    await saveMediaVersion(versionRecord);
+    await updateMediaItem(media.id, {
+      activeVersionId: versionId,
+      sha256Hash: sha256Hash || undefined,
+      duration: versionRecord.duration,
+      storageBackend: backend,
+      processingStatus: 'processing',
+    });
+
+    await queueManager.enqueue({
+      idempotencyKey: `hls_${media.id}_${versionId}`,
+      mediaId: media.id,
+      versionId,
+      jobType: 'transcode_hls',
+      priority: 8,
+      createdBy,
+    });
   } catch (err) {
-    console.warn('[handleMkvPostUpload Notice]:', err);
+    console.warn('[stageUploadVersionAndQueueHls Notice]:', err);
   }
 }
 
@@ -356,23 +455,27 @@ function getCountryFromReq(req: Request): string {
   return 'Bangladesh';
 }
 
-// 1. Overall System Status
-apiRouter.get('/status', async (_req: Request, res: Response) => {
+// 1. Overall System Status (Authenticated Only - Never expose email or secrets unauthenticated)
+apiRouter.get('/status', requireAuth(['admin', 'editor']), async (req: Request, res: Response) => {
   const tgState = telegramService.getState();
   const storage = await getStorageConfig();
+  const cfg = getFirebaseConfig();
   const appUrl = process.env.APP_URL || '';
-  const adminEmail = process.env.ADMIN_EMAIL || 'admin@vidframe.ai';
 
   res.json({
     telegram: tgState,
-    storage: storage || { configured: false },
+    storage: sanitizeStorageConfigForClient(storage),
     appUrl,
-    adminEmail,
+    adminEmail: req.authCtx?.email || '',
+    role: req.authCtx?.role || 'editor',
+    firestoreDatabaseId: cfg.firestoreDatabaseId,
+    queueDriver: queueManager.getDriverName(),
+    aiProviders: listAvailableAiProviders(),
   });
 });
 
 // 2. Save Telegram Credentials
-apiRouter.post('/telegram/credentials', (req: Request, res: Response) => {
+apiRouter.post('/telegram/credentials', requireAuth(['admin']), rateLimit('auth'), async (req: Request, res: Response) => {
   const { apiId, apiHash } = req.body;
   if (!apiId || !apiHash) {
     return res.status(400).json({ error: 'Both apiId and apiHash are required.' });
@@ -385,12 +488,13 @@ apiRouter.post('/telegram/credentials', (req: Request, res: Response) => {
 
   telegramService.saveCredentials(parsedId, String(apiHash).trim());
   telegramService.init().catch(() => {});
+  await recordAudit(req, 'telegram.credentials_saved', 'settings', 'telegram');
 
   res.json({ success: true, message: 'Telegram credentials saved successfully.' });
 });
 
 // 3. Telegram Login: Send Code
-apiRouter.post('/telegram/send-code', async (req: Request, res: Response) => {
+apiRouter.post('/telegram/send-code', requireAuth(['admin']), rateLimit('auth'), async (req: Request, res: Response) => {
   const { phoneNumber } = req.body;
   if (!phoneNumber) {
     return res.status(400).json({ error: 'Phone number is required.' });
@@ -405,7 +509,7 @@ apiRouter.post('/telegram/send-code', async (req: Request, res: Response) => {
 });
 
 // 4. Telegram Login: Verify Code
-apiRouter.post('/telegram/verify-code', async (req: Request, res: Response) => {
+apiRouter.post('/telegram/verify-code', requireAuth(['admin']), rateLimit('auth'), async (req: Request, res: Response) => {
   const { code } = req.body;
   if (!code) {
     return res.status(400).json({ error: 'Verification code is required.' });
@@ -413,6 +517,7 @@ apiRouter.post('/telegram/verify-code', async (req: Request, res: Response) => {
 
   try {
     const result = await telegramService.verifyCode(code);
+    await recordAudit(req, 'telegram.login_verified', 'settings', 'telegram');
     res.json(result);
   } catch (error: any) {
     res.status(400).json({ error: error?.message || 'Verification failed' });
@@ -420,7 +525,7 @@ apiRouter.post('/telegram/verify-code', async (req: Request, res: Response) => {
 });
 
 // 5. Telegram Login: Verify 2FA
-apiRouter.post('/telegram/verify-2fa', async (req: Request, res: Response) => {
+apiRouter.post('/telegram/verify-2fa', requireAuth(['admin']), rateLimit('auth'), async (req: Request, res: Response) => {
   const { password } = req.body;
   if (!password) {
     return res.status(400).json({ error: '2FA password is required.' });
@@ -428,6 +533,7 @@ apiRouter.post('/telegram/verify-2fa', async (req: Request, res: Response) => {
 
   try {
     const result = await telegramService.verify2FAPassword(password);
+    await recordAudit(req, 'telegram.2fa_verified', 'settings', 'telegram');
     res.json(result);
   } catch (error: any) {
     res.status(400).json({ error: error?.message || '2FA verification failed' });
@@ -435,9 +541,10 @@ apiRouter.post('/telegram/verify-2fa', async (req: Request, res: Response) => {
 });
 
 // 6. Telegram Disconnect
-apiRouter.post('/telegram/disconnect', async (_req: Request, res: Response) => {
+apiRouter.post('/telegram/disconnect', requireAuth(['admin']), async (req: Request, res: Response) => {
   try {
     await telegramService.disconnect();
+    await recordAudit(req, 'telegram.disconnected', 'settings', 'telegram');
     res.json({ success: true, message: 'Telegram session cleared.' });
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to disconnect.' });
@@ -445,9 +552,10 @@ apiRouter.post('/telegram/disconnect', async (_req: Request, res: Response) => {
 });
 
 // 6b. Telegram Explicit Reconnect & Health Check
-apiRouter.post('/telegram/reconnect', async (_req: Request, res: Response) => {
+apiRouter.post('/telegram/reconnect', requireAuth(['admin', 'editor']), async (req: Request, res: Response) => {
   try {
     await telegramService.reconnect();
+    await recordAudit(req, 'telegram.reconnected', 'settings', 'telegram');
     res.json({
       success: true,
       message: 'Telegram MTProto client reconnected successfully.',
@@ -461,13 +569,13 @@ apiRouter.post('/telegram/reconnect', async (_req: Request, res: Response) => {
   }
 });
 
-// 7. Storage Config
-apiRouter.get('/storage/config', async (_req: Request, res: Response) => {
+// 7. Storage Config (Sanitized)
+apiRouter.get('/storage/config', requireAuth(['admin', 'editor']), async (_req: Request, res: Response) => {
   const config = await getStorageConfig();
-  res.json(config || { configured: false });
+  res.json(sanitizeStorageConfigForClient(config));
 });
 
-apiRouter.post('/storage/test', async (req: Request, res: Response) => {
+apiRouter.post('/storage/test', requireAuth(['admin']), async (req: Request, res: Response) => {
   const { chatId } = req.body;
   if (!chatId) {
     return res.status(400).json({ error: 'Chat ID or username is required.' });
@@ -475,15 +583,28 @@ apiRouter.post('/storage/test', async (req: Request, res: Response) => {
 
   try {
     const verified = await telegramService.testStorage(String(chatId).trim());
-    res.json({ success: true, storage: verified });
+    await recordAudit(req, 'storage.telegram_tested', 'settings', 'storage', { chatId: verified.chatId });
+    res.json({ success: true, storage: sanitizeStorageConfigForClient(verified) });
   } catch (error: any) {
     res.status(400).json({ error: error?.message || 'Storage verification failed' });
   }
 });
 
-// 9. Media Library: List
-apiRouter.get('/media', async (_req: Request, res: Response) => {
+// 9. Media Library: List (Supports cursor pagination when ?paginated=true)
+apiRouter.get('/media', requireAuth(['admin', 'editor', 'api_key']), async (req: Request, res: Response) => {
   try {
+    const usePaginated = req.query.paginated === 'true';
+    if (usePaginated) {
+      const result = await listMediaPaginated({
+        limit: Number(req.query.limit || 24),
+        cursor: typeof req.query.cursor === 'string' ? req.query.cursor : undefined,
+        visibility: typeof req.query.visibility === 'string' ? req.query.visibility : undefined,
+        folder: typeof req.query.folder === 'string' ? req.query.folder : undefined,
+        status: typeof req.query.status === 'string' ? req.query.status : undefined,
+        search: typeof req.query.search === 'string' ? req.query.search : undefined,
+      });
+      return res.json(result);
+    }
     const items = await getMediaItems();
     res.json(items);
   } catch (error: any) {
@@ -491,118 +612,147 @@ apiRouter.get('/media', async (_req: Request, res: Response) => {
   }
 });
 
-// 10. Media Library: Upload (Supports any format including MKV, automatic streaming 2GB+ chunk splitting)
-apiRouter.post('/media/upload', upload.single('video'), async (req: Request, res: Response) => {
-  if (!req.file) {
-    return res.status(400).json({ error: 'No video file provided.' });
-  }
+// 10. Media Library: Upload (Supports Pluggable S3/R2/Local/Telegram + SHA-256 Duplicate Warning + Async HLS Packaging)
+apiRouter.post(
+  '/media/upload',
+  requireAuth(['admin', 'editor']),
+  rateLimit('upload'),
+  upload.single('video'),
+  async (req: Request, res: Response) => {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No video file provided.' });
+    }
 
-  const tempFilePath = req.file.path;
-  const originalName = req.file.originalname;
-  const mimeType = req.file.mimetype || (originalName.endsWith('.mkv') ? 'video/x-matroska' : 'video/mp4');
-  const fileSize = req.file.size;
-  const title = (req.body.title || originalName.replace(/\.[^/.]+$/, '')).trim();
-  const description = (req.body.description || '').trim();
-  const visibility = ['public', 'unlisted', 'private'].includes(req.body.visibility)
-    ? req.body.visibility
-    : 'public';
+    const tempFilePath = req.file.path;
+    const originalName = req.file.originalname;
+    const mimeType = req.file.mimetype || (originalName.endsWith('.mkv') ? 'video/x-matroska' : 'video/mp4');
+    const fileSize = req.file.size;
+    const title = (req.body.title || originalName.replace(/\.[^/.]+$/, '')).trim();
+    const description = (req.body.description || '').trim();
+    const visibility = ['public', 'unlisted', 'private'].includes(req.body.visibility)
+      ? req.body.visibility
+      : 'public';
 
-  const introStart = Number(req.body.introStart) || 0;
-  const introEnd = Number(req.body.introEnd) || 0;
-  const outroStart = Number(req.body.outroStart) || 0;
-  const outroEnd = Number(req.body.outroEnd) || 0;
+    const introStart = Number(req.body.introStart) || 0;
+    const introEnd = Number(req.body.introEnd) || 0;
+    const outroStart = Number(req.body.outroStart) || 0;
+    const outroEnd = Number(req.body.outroEnd) || 0;
 
-  try {
-    const MAX_CHUNK = 1.9 * 1024 * 1024 * 1024; // 1.9 GB per part
-    const messageIds: number[] = [];
-    let mainChatId = '';
-    let totalUploadedSize = 0;
-    let finalDuration = 0;
+    try {
+      const sha256Hash = await computeFileSha256(tempFilePath);
+      const duplicateMatch = await findMediaBySha256(sha256Hash).catch(() => null);
+      const adapter = await getStorageAdapter();
+      const mediaId = crypto.randomBytes(8).toString('hex');
 
-    if (fileSize > MAX_CHUNK) {
-      console.log(`[Upload] Large video (${fileSize} bytes) exceeds 2GB limit. Splitting via stream pipes...`);
-      let offset = 0;
-      let partIndex = 1;
+      const messageIds: number[] = [];
+      let mainChatId = '';
+      let totalUploadedSize = fileSize;
+      let finalDuration = 0;
 
-      while (offset < fileSize) {
-        const currentChunkSize = Math.min(MAX_CHUNK, fileSize - offset);
-        const chunkPath = path.join(uploadDir, `part_${Date.now()}_${partIndex}_${originalName}`);
-
-        // Stream slice directly without allocating large buffer
-        await streamFileChunk(tempFilePath, chunkPath, offset, offset + currentChunkSize);
-
-        const partCaption = `VidFrame [Part ${partIndex}]: ${title} (${originalName})`;
-        const uploadRes = await telegramService.uploadVideo(
-          chunkPath,
-          `${originalName}.part${partIndex}`,
-          mimeType,
-          partCaption
-        );
-
-        messageIds.push(uploadRes.messageId);
-        mainChatId = uploadRes.chatId;
-        totalUploadedSize += uploadRes.size;
-        if (uploadRes.duration && uploadRes.duration > finalDuration) {
-          finalDuration = uploadRes.duration;
+      if (adapter.mode === 's3_r2' || adapter.mode === 'local_dev') {
+        const ext = path.extname(originalName) || '.mp4';
+        const tempVerId = `ver_init_${mediaId}`;
+        await adapter.putFile(`media/${mediaId}/${tempVerId}/master_source${ext}`, tempFilePath, mimeType);
+      } else {
+        const MAX_CHUNK = 1.9 * 1024 * 1024 * 1024;
+        if (fileSize > MAX_CHUNK) {
+          let offset = 0;
+          let partIndex = 1;
+          totalUploadedSize = 0;
+          while (offset < fileSize) {
+            const currentChunkSize = Math.min(MAX_CHUNK, fileSize - offset);
+            const chunkPath = path.join(uploadDir, `part_${Date.now()}_${partIndex}_${originalName}`);
+            await streamFileChunk(tempFilePath, chunkPath, offset, offset + currentChunkSize);
+            const partCaption = `VidFrame [Part ${partIndex}]: ${title} (${originalName})`;
+            const uploadRes = await telegramService.uploadVideo(
+              chunkPath,
+              `${originalName}.part${partIndex}`,
+              mimeType,
+              partCaption
+            );
+            messageIds.push(uploadRes.messageId);
+            mainChatId = uploadRes.chatId;
+            totalUploadedSize += uploadRes.size;
+            if (uploadRes.duration && uploadRes.duration > finalDuration) {
+              finalDuration = uploadRes.duration;
+            }
+            if (fs.existsSync(chunkPath)) try { fs.unlinkSync(chunkPath); } catch {}
+            offset += currentChunkSize;
+            partIndex++;
+          }
+        } else {
+          const uploadResult = await telegramService.uploadVideo(
+            tempFilePath,
+            originalName,
+            mimeType,
+            `VidFrame: ${title}`
+          );
+          messageIds.push(uploadResult.messageId);
+          mainChatId = uploadResult.chatId;
+          totalUploadedSize = uploadResult.size || fileSize;
+          finalDuration = uploadResult.duration || 0;
         }
-
-        if (fs.existsSync(chunkPath)) {
-          try { fs.unlinkSync(chunkPath); } catch {}
-        }
-
-        offset += currentChunkSize;
-        partIndex++;
       }
-    } else {
-      const uploadResult = await telegramService.uploadVideo(
-        tempFilePath,
-        originalName,
+
+      const newMedia: MediaRecord = {
+        id: mediaId,
+        title,
+        description: description || (originalName.endsWith('.mkv') ? 'MKV Container (Audio & Subtitles detected)' : ''),
+        filename: originalName,
         mimeType,
-        `VidFrame: ${title}`
-      );
-      messageIds.push(uploadResult.messageId);
-      mainChatId = uploadResult.chatId;
-      totalUploadedSize = uploadResult.size || fileSize;
-      finalDuration = uploadResult.duration || 0;
-    }
+        size: totalUploadedSize,
+        duration: finalDuration,
+        telegramChatId: mainChatId,
+        telegramMessageId: messageIds[0] || 0,
+        telegramMessageIds: messageIds,
+        introStart,
+        introEnd,
+        outroStart,
+        outroEnd,
+        visibility,
+        processingStatus: 'processing',
+        playbackMode: 'legacy_telegram',
+        storageBackend: adapter.mode,
+        sha256Hash,
+        ownerId: req.authCtx?.uid,
+        views: 0,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
 
-    const mediaId = crypto.randomBytes(8).toString('hex');
-    const newMedia: MediaRecord = {
-      id: mediaId,
-      title,
-      description: description || (originalName.endsWith('.mkv') ? 'MKV Container (Audio & Subtitles detected)' : ''),
-      filename: originalName,
-      mimeType,
-      size: totalUploadedSize,
-      duration: finalDuration,
-      telegramChatId: mainChatId,
-      telegramMessageId: messageIds[0],
-      telegramMessageIds: messageIds,
-      introStart,
-      introEnd,
-      outroStart,
-      outroEnd,
-      visibility,
-      processingStatus: 'ready',
-      views: 0,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
+      await saveMediaItem(newMedia);
+      await stageUploadVersionAndQueueHls(tempFilePath, newMedia, req.authCtx!.uid, adapter.mode);
+      if (adapter.mode === 's3_r2' || adapter.mode === 'local_dev') {
+        const latest = await getMediaItem(mediaId);
+        if (latest?.activeVersionId) {
+          const ext = path.extname(originalName) || '.mp4';
+          await adapter.putFile(`media/${mediaId}/${latest.activeVersionId}/master_source${ext}`, tempFilePath, mimeType);
+        }
+      }
 
-    await saveMediaItem(newMedia);
-    await handleMkvPostUpload(tempFilePath, newMedia);
-    res.json({ success: true, media: newMedia });
-  } catch (error: any) {
-    console.error('Upload failed:', error);
-    res.status(500).json({
-      error: error?.message || 'Failed to upload video to Telegram storage channel.',
-    });
-  } finally {
-    if (fs.existsSync(tempFilePath)) {
-      try { fs.unlinkSync(tempFilePath); } catch {}
+      await recordAudit(req, 'media.uploaded', 'media', mediaId, {
+        filename: originalName,
+        size: totalUploadedSize,
+        backend: adapter.mode,
+      });
+
+      res.json({
+        success: true,
+        media: (await getMediaItem(mediaId)) || newMedia,
+        duplicateWarning: duplicateMatch ? { id: duplicateMatch.id, title: duplicateMatch.title } : null,
+      });
+    } catch (error: any) {
+      console.error('Upload failed:', error);
+      res.status(500).json({
+        error: error?.message || 'Failed to upload video to storage backend.',
+      });
+    } finally {
+      if (fs.existsSync(tempFilePath)) {
+        try { fs.unlinkSync(tempFilePath); } catch {}
+      }
     }
   }
-});
+);
 
 // Helper: Append a chunk to a destination write stream
 function appendFileChunk(sourcePath: string, destStream: fs.WriteStream): Promise<void> {
@@ -614,9 +764,10 @@ function appendFileChunk(sourcePath: string, destStream: fs.WriteStream): Promis
   });
 }
 
-// 10b. Chunked Upload: Receive a 2.5MB chunk with multer error protection
+// 10b. Chunked Upload: Receive a 2MB chunk with auth + multer error protection
 apiRouter.post(
   '/media/upload-chunk',
+  requireAuth(['admin', 'editor']),
   (req: Request, res: Response, next) => {
     upload.single('chunk')(req, res, (err) => {
       if (err) {
@@ -668,8 +819,8 @@ export interface UploadProgressRecord {
 
 const activeUploadProgress = new Map<string, UploadProgressRecord>();
 
-// Poll endpoint for real-time progress during server assemble and Telegram MTProto upload
-apiRouter.get('/media/upload-progress/:uploadId', (req: Request, res: Response) => {
+// Poll endpoint for real-time progress during server assemble and upload
+apiRouter.get('/media/upload-progress/:uploadId', requireAuth(['admin', 'editor']), (req: Request, res: Response) => {
   const { uploadId } = req.params;
   const progress = activeUploadProgress.get(uploadId);
   if (!progress) {
@@ -683,8 +834,8 @@ apiRouter.get('/media/upload-progress/:uploadId', (req: Request, res: Response) 
   res.json(progress);
 });
 
-// 10c. Chunked Upload: Assemble chunks and upload to Telegram
-apiRouter.post('/media/upload-finish', async (req: Request, res: Response) => {
+// 10c. Chunked Upload: Assemble chunks, upload master to active storage backend, create v1 version & enqueue HLS ABR packaging
+apiRouter.post('/media/upload-finish', requireAuth(['admin', 'editor']), rateLimit('upload'), async (req: Request, res: Response) => {
   const {
     uploadId,
     totalChunks,
@@ -720,7 +871,6 @@ apiRouter.post('/media/upload-finish', async (req: Request, res: Response) => {
   let uploadFilePath = assembledFilePath;
 
   try {
-    // 1. Verify all chunks exist and assemble them into one continuous file
     for (let i = 0; i < total; i++) {
       const chunkFile = path.join(uploadDir, `chunk_${uploadId}_${i}`);
       if (!fs.existsSync(chunkFile)) {
@@ -731,13 +881,16 @@ apiRouter.post('/media/upload-finish', async (req: Request, res: Response) => {
       try { fs.unlinkSync(chunkFile); } catch {}
     }
 
-    const stats = fs.statSync(assembledFilePath);
     uploadFilePath = assembledFilePath;
     let finalOriginalName = originalName;
     let finalMimeType = reqMimeType || (originalName.toLowerCase().endsWith('.mkv') ? 'video/x-matroska' : 'video/mp4');
 
-    // If MKV format: probe and remux into streamable faststart MP4 container so it streams natively
-    if (finalOriginalName.toLowerCase().endsWith('.mkv') || finalMimeType.includes('matroska')) {
+    const adapter = await getStorageAdapter();
+    const sha256Hash = await computeFileSha256(assembledFilePath);
+    const duplicateMatch = await findMediaBySha256(sha256Hash).catch(() => null);
+
+    // If Telegram backend + MKV: faststart remux so direct MP4 fallback is instant while HLS worker packages full ABR ladder
+    if (adapter.mode === 'telegram' && (finalOriginalName.toLowerCase().endsWith('.mkv') || finalMimeType.includes('matroska'))) {
       activeUploadProgress.set(uploadId, {
         stage: 'assembling',
         telegramPercent: 0,
@@ -758,7 +911,6 @@ apiRouter.post('/media/upload-finish', async (req: Request, res: Response) => {
       ]);
 
       if (remuxRes.status === 0 && fs.existsSync(mp4ConvertedPath) && fs.statSync(mp4ConvertedPath).size > 1024) {
-        try { fs.unlinkSync(assembledFilePath); } catch {}
         uploadFilePath = mp4ConvertedPath;
         finalOriginalName = originalName.replace(/\.mkv$/i, '.mp4');
         finalMimeType = 'video/mp4';
@@ -772,117 +924,146 @@ apiRouter.post('/media/upload-finish', async (req: Request, res: Response) => {
     const mimeType = finalMimeType;
     const visibility = ['public', 'unlisted', 'private'].includes(reqVisibility) ? reqVisibility : 'public';
 
-    activeUploadProgress.set(uploadId, {
-      stage: 'uploading_telegram',
-      telegramPercent: 0,
-      overallPercent: 91,
-      statusText: 'Starting Telegram cloud upload...',
-      updatedAt: Date.now(),
-    });
-
-    const MAX_CHUNK = 1.9 * 1024 * 1024 * 1024; // 1.9 GB per part
+    const mediaId = crypto.randomBytes(8).toString('hex');
     const messageIds: number[] = [];
     let mainChatId = '';
-    let totalUploadedSize = 0;
+    let totalUploadedSize = fileSize;
     let finalDuration = 0;
 
-    if (fileSize > MAX_CHUNK) {
-      console.log(`[Upload Chunked] Large video (${fileSize} bytes) exceeds 2GB limit. Splitting via stream pipes...`);
-      let offset = 0;
-      let partIndex = 1;
+    if (adapter.mode === 's3_r2' || adapter.mode === 'local_dev') {
+      activeUploadProgress.set(uploadId, {
+        stage: 'uploading_telegram',
+        telegramPercent: 40,
+        overallPercent: 93,
+        statusText: `Storing master source on ${adapter.mode}...`,
+        updatedAt: Date.now(),
+      });
+    } else {
+      activeUploadProgress.set(uploadId, {
+        stage: 'uploading_telegram',
+        telegramPercent: 0,
+        overallPercent: 91,
+        statusText: 'Starting Telegram cloud upload...',
+        updatedAt: Date.now(),
+      });
 
-      while (offset < fileSize) {
-        const currentChunkSize = Math.min(MAX_CHUNK, fileSize - offset);
-        const chunkPath = path.join(uploadDir, `part_${Date.now()}_${partIndex}_${finalOriginalName}`);
+      const MAX_CHUNK = 1.9 * 1024 * 1024 * 1024;
+      if (fileSize > MAX_CHUNK) {
+        let offset = 0;
+        let partIndex = 1;
+        totalUploadedSize = 0;
 
-        await streamFileChunk(uploadFilePath, chunkPath, offset, offset + currentChunkSize);
+        while (offset < fileSize) {
+          const currentChunkSize = Math.min(MAX_CHUNK, fileSize - offset);
+          const chunkPath = path.join(uploadDir, `part_${Date.now()}_${partIndex}_${finalOriginalName}`);
+          await streamFileChunk(uploadFilePath, chunkPath, offset, offset + currentChunkSize);
 
-        const partCaption = `VidFrame [Part ${partIndex}]: ${title} (${finalOriginalName})`;
-        const uploadRes = await telegramService.uploadVideo(
-          chunkPath,
-          `${finalOriginalName}.part${partIndex}`,
+          const partCaption = `VidFrame [Part ${partIndex}]: ${title} (${finalOriginalName})`;
+          const uploadRes = await telegramService.uploadVideo(
+            chunkPath,
+            `${finalOriginalName}.part${partIndex}`,
+            mimeType,
+            partCaption,
+            (partPercent) => {
+              const overall = 91 + Math.min(8, Math.floor(((offset + (partPercent / 100) * currentChunkSize) / fileSize) * 8));
+              activeUploadProgress.set(uploadId, {
+                stage: 'uploading_telegram',
+                telegramPercent: partPercent,
+                overallPercent: overall,
+                statusText: `Uploading Part ${partIndex}: ${partPercent}% to Telegram cloud...`,
+                updatedAt: Date.now(),
+              });
+            }
+          );
+
+          messageIds.push(uploadRes.messageId);
+          mainChatId = uploadRes.chatId;
+          totalUploadedSize += uploadRes.size;
+          if (uploadRes.duration && uploadRes.duration > finalDuration) {
+            finalDuration = uploadRes.duration;
+          }
+          if (fs.existsSync(chunkPath)) try { fs.unlinkSync(chunkPath); } catch {}
+          offset += currentChunkSize;
+          partIndex++;
+        }
+      } else {
+        const uploadResult = await telegramService.uploadVideo(
+          uploadFilePath,
+          finalOriginalName,
           mimeType,
-          partCaption,
-          (partPercent) => {
-            const overall = 91 + Math.min(8, Math.floor(((offset + (partPercent / 100) * currentChunkSize) / fileSize) * 8));
+          `VidFrame: ${title}`,
+          (telegramPercent) => {
+            const overall = 91 + Math.min(8, Math.floor((telegramPercent / 100) * 8));
             activeUploadProgress.set(uploadId, {
               stage: 'uploading_telegram',
-              telegramPercent: partPercent,
+              telegramPercent,
               overallPercent: overall,
-              statusText: `Uploading Part ${partIndex}: ${partPercent}% to Telegram cloud...`,
+              statusText: `Uploading to Telegram cloud: ${telegramPercent}%`,
               updatedAt: Date.now(),
             });
           }
         );
-
-        messageIds.push(uploadRes.messageId);
-        mainChatId = uploadRes.chatId;
-        totalUploadedSize += uploadRes.size;
-        if (uploadRes.duration && uploadRes.duration > finalDuration) {
-          finalDuration = uploadRes.duration;
-        }
-
-        if (fs.existsSync(chunkPath)) {
-          try { fs.unlinkSync(chunkPath); } catch {}
-        }
-
-        offset += currentChunkSize;
-        partIndex++;
+        messageIds.push(uploadResult.messageId);
+        mainChatId = uploadResult.chatId;
+        totalUploadedSize = uploadResult.size || fileSize;
+        finalDuration = uploadResult.duration || 0;
       }
-    } else {
-      const uploadResult = await telegramService.uploadVideo(
-        uploadFilePath,
-        finalOriginalName,
-        mimeType,
-        `VidFrame: ${title}`,
-        (telegramPercent) => {
-          const overall = 91 + Math.min(8, Math.floor((telegramPercent / 100) * 8));
-          activeUploadProgress.set(uploadId, {
-            stage: 'uploading_telegram',
-            telegramPercent,
-            overallPercent: overall,
-            statusText: `Uploading to Telegram cloud: ${telegramPercent}%`,
-            updatedAt: Date.now(),
-          });
-        }
-      );
-      messageIds.push(uploadResult.messageId);
-      mainChatId = uploadResult.chatId;
-      totalUploadedSize = uploadResult.size || fileSize;
-      finalDuration = uploadResult.duration || 0;
     }
 
-    const mediaId = crypto.randomBytes(8).toString('hex');
     const newMedia: MediaRecord = {
       id: mediaId,
       title,
       description: description || (finalOriginalName.endsWith('.mkv') ? 'MKV Container (Audio & Subtitles detected)' : ''),
-      filename: finalOriginalName,
+      filename: originalName,
       mimeType,
       size: totalUploadedSize,
       duration: finalDuration,
       telegramChatId: mainChatId,
-      telegramMessageId: messageIds[0],
+      telegramMessageId: messageIds[0] || 0,
       telegramMessageIds: messageIds,
       introStart: Number(introStart) || 0,
       introEnd: Number(introEnd) || 0,
       outroStart: Number(outroStart) || 0,
       outroEnd: Number(outroEnd) || 0,
       visibility,
-      processingStatus: 'ready',
+      folder: folder ? String(folder).trim() : undefined,
+      processingStatus: 'processing',
+      playbackMode: 'legacy_telegram',
+      storageBackend: adapter.mode,
+      sha256Hash,
+      ownerId: req.authCtx?.uid,
       views: 0,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
 
     await saveMediaItem(newMedia);
-    await handleMkvPostUpload(assembledFilePath, newMedia);
-    const responsePayload = { success: true, media: newMedia };
+    await stageUploadVersionAndQueueHls(assembledFilePath, newMedia, req.authCtx!.uid, adapter.mode);
+    if (adapter.mode === 's3_r2' || adapter.mode === 'local_dev') {
+      const latest = await getMediaItem(mediaId);
+      if (latest?.activeVersionId) {
+        const ext = path.extname(originalName) || '.mp4';
+        await adapter.putFile(`media/${mediaId}/${latest.activeVersionId}/master_source${ext}`, assembledFilePath, mimeType);
+      }
+    }
+
+    await recordAudit(req, 'media.uploaded_chunked', 'media', mediaId, {
+      filename: originalName,
+      size: totalUploadedSize,
+      backend: adapter.mode,
+    });
+
+    const savedMedia = (await getMediaItem(mediaId)) || newMedia;
+    const responsePayload = {
+      success: true,
+      media: savedMedia,
+      duplicateWarning: duplicateMatch ? { id: duplicateMatch.id, title: duplicateMatch.title } : null,
+    };
     activeUploadProgress.set(uploadId, {
       stage: 'complete',
       telegramPercent: 100,
       overallPercent: 100,
-      statusText: 'Upload complete! Media ready.',
+      statusText: 'Upload complete! HLS packaging queued.',
       result: responsePayload,
       updatedAt: Date.now(),
     });
@@ -894,11 +1075,11 @@ apiRouter.post('/media/upload-finish', async (req: Request, res: Response) => {
       stage: 'error',
       telegramPercent: 0,
       overallPercent: 0,
-      statusText: error?.message || 'Failed to assemble and upload video to Telegram',
-      error: error?.message || 'Failed to assemble and upload video to Telegram',
+      statusText: error?.message || 'Failed to assemble and upload video',
+      error: error?.message || 'Failed to assemble and upload video',
       updatedAt: Date.now(),
     });
-    res.status(500).json({ error: error?.message || 'Failed to assemble and upload video to Telegram' });
+    res.status(500).json({ error: error?.message || 'Failed to assemble and upload video' });
   } finally {
     if (fs.existsSync(assembledFilePath)) {
       try { fs.unlinkSync(assembledFilePath); } catch {}
@@ -909,7 +1090,7 @@ apiRouter.post('/media/upload-finish', async (req: Request, res: Response) => {
   }
 });
 
-// 11. Media Library: Get single & register view event
+// 11. Media Library: Get single & register view event (enforces private check)
 apiRouter.get('/media/:mediaId', async (req: Request, res: Response) => {
   const { mediaId } = req.params;
   const item = await getMediaItem(mediaId);
@@ -917,7 +1098,15 @@ apiRouter.get('/media/:mediaId', async (req: Request, res: Response) => {
     return res.status(404).json({ error: 'Media not found' });
   }
 
-  // Record real view event
+  if (item.visibility === 'private' && !req.authCtx) {
+    const token = typeof req.query.token === 'string' ? req.query.token : '';
+    const check = token && item.activeVersionId ? verifySignedPlaybackToken(token, mediaId, item.activeVersionId) : { valid: false };
+    if (!check.valid) {
+      return res.status(403).json({ error: 'Authentication or valid signed token required for private media.' });
+    }
+  }
+
+  // Record real view event + write-sharded view counter
   const ua = req.headers['user-agent'] || '';
   const parsedUA = parseUserAgent(ua);
   const country = getCountryFromReq(req);
@@ -934,14 +1123,13 @@ apiRouter.get('/media/:mediaId', async (req: Request, res: Response) => {
   };
 
   recordViewEvent(event).catch(() => {});
-  const nextViews = (item.views || 0) + 1;
-  updateMediaItem(mediaId, { views: nextViews }).catch(() => {});
+  incrementShardedView(mediaId).catch(() => {});
 
-  res.json({ ...item, views: nextViews });
+  res.json(item);
 });
 
 // 12. Media Library: Update metadata
-apiRouter.put('/media/:mediaId', async (req: Request, res: Response) => {
+apiRouter.put('/media/:mediaId', requireAuth(['admin', 'editor']), async (req: Request, res: Response) => {
   const { mediaId } = req.params;
   const updates = req.body;
 
@@ -950,6 +1138,7 @@ apiRouter.put('/media/:mediaId', async (req: Request, res: Response) => {
     if (!updated) {
       return res.status(404).json({ error: 'Media not found' });
     }
+    await recordAudit(req, 'media.updated', 'media', mediaId);
     res.json({ success: true, media: updated });
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to update media item' });
@@ -957,10 +1146,11 @@ apiRouter.put('/media/:mediaId', async (req: Request, res: Response) => {
 });
 
 // 13. Media Library: Delete
-apiRouter.delete('/media/:mediaId', async (req: Request, res: Response) => {
+apiRouter.delete('/media/:mediaId', requireAuth(['admin', 'editor']), async (req: Request, res: Response) => {
   const { mediaId } = req.params;
   try {
     await deleteMediaItem(mediaId);
+    await recordAudit(req, 'media.deleted', 'media', mediaId);
     res.json({ success: true, message: 'Media removed.' });
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to delete media.' });
@@ -968,7 +1158,7 @@ apiRouter.delete('/media/:mediaId', async (req: Request, res: Response) => {
 });
 
 // Batch Delete & Move
-apiRouter.post('/media/batch-delete', async (req: Request, res: Response) => {
+apiRouter.post('/media/batch-delete', requireAuth(['admin', 'editor']), async (req: Request, res: Response) => {
   const { ids } = req.body;
   if (!Array.isArray(ids) || ids.length === 0) {
     return res.status(400).json({ error: 'No media IDs provided.' });
@@ -977,13 +1167,14 @@ apiRouter.post('/media/batch-delete', async (req: Request, res: Response) => {
     for (const id of ids) {
       await deleteMediaItem(id);
     }
+    await recordAudit(req, 'media.batch_deleted', 'media', 'bulk', { count: ids.length });
     res.json({ success: true, count: ids.length });
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed batch delete.' });
   }
 });
 
-apiRouter.post('/media/batch-folder', async (req: Request, res: Response) => {
+apiRouter.post('/media/batch-folder', requireAuth(['admin', 'editor']), async (req: Request, res: Response) => {
   const { ids, folder } = req.body;
   if (!Array.isArray(ids) || ids.length === 0) {
     return res.status(400).json({ error: 'No media IDs provided.' });
@@ -992,95 +1183,15 @@ apiRouter.post('/media/batch-folder', async (req: Request, res: Response) => {
     for (const id of ids) {
       await updateMediaItem(id, { folder: folder || '' });
     }
+    await recordAudit(req, 'media.batch_moved', 'media', 'bulk', { count: ids.length, folder: folder || '' });
     res.json({ success: true, count: ids.length });
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed batch folder update.' });
   }
 });
 
-// Helper: Stream download from direct URL to disk without loading entire video into RAM
-async function downloadUrlToTempFile(
-  url: string,
-  destPath: string
-): Promise<{ fileName: string; mimeType: string; size: number }> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 1800000); // 30 min max for large GB+ downloads
-
-  try {
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 VidFrame/2.0',
-      },
-      redirect: 'follow',
-      signal: controller.signal,
-    });
-
-    if (!response.ok && response.status !== 206) {
-      throw new Error(`Failed to download URL (HTTP ${response.status} ${response.statusText})`);
-    }
-
-    const headerLength = Number(response.headers.get('content-length') || 0);
-    const headerType = response.headers.get('content-type') || '';
-
-    // Extract filename from Content-Disposition if present
-    let fileName = '';
-    const disposition = response.headers.get('content-disposition');
-    if (disposition && disposition.includes('filename=')) {
-      const match = disposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/);
-      if (match && match[1]) {
-        fileName = match[1].replace(/['"]/g, '').trim();
-      }
-    }
-    if (!fileName) {
-      try {
-        const parsed = new URL(url);
-        fileName = path.basename(parsed.pathname);
-      } catch {}
-    }
-    if (!fileName || fileName === '/' || !fileName.includes('.')) {
-      fileName = `video_${Date.now()}.mp4`;
-    }
-    fileName = fileName.replace(/[^\w\s.-]/gi, '_');
-
-    const fileStream = fs.createWriteStream(destPath);
-
-    if (response.body && typeof (response.body as any).getReader === 'function') {
-      const { Readable } = await import('node:stream');
-      const nodeReadable = Readable.fromWeb(response.body as any);
-      await new Promise<void>((resolve, reject) => {
-        nodeReadable.pipe(fileStream);
-        fileStream.on('finish', resolve);
-        fileStream.on('error', reject);
-        nodeReadable.on('error', reject);
-      });
-    } else if (response.body && (response.body as any).pipe) {
-      await new Promise<void>((resolve, reject) => {
-        (response.body as any).pipe(fileStream);
-        fileStream.on('finish', resolve);
-        fileStream.on('error', reject);
-        (response.body as any).on('error', reject);
-      });
-    } else {
-      throw new Error('Unsupported response stream body from video URL');
-    }
-
-    const stat = fs.statSync(destPath);
-    const mimeType = fileName.toLowerCase().endsWith('.mkv')
-      ? 'video/x-matroska'
-      : (headerType.startsWith('video/') ? headerType : 'video/mp4');
-
-    return {
-      fileName,
-      mimeType,
-      size: stat.size || headerLength,
-    };
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-// Check URL(s) to verify if download link is active and valid before downloading
-apiRouter.post('/media/check-url', async (req: Request, res: Response) => {
+// SSRF-Hardened Check URL(s) to verify link safety, DNS pinning, content-type, and file size
+apiRouter.post('/media/check-url', requireAuth(['admin', 'editor']), rateLimit('urlImport'), async (req: Request, res: Response) => {
   const rawUrls: string[] = Array.isArray(req.body.urls)
     ? req.body.urls
     : req.body.url
@@ -1095,92 +1206,16 @@ apiRouter.post('/media/check-url', async (req: Request, res: Response) => {
     rawUrls.map(async (raw) => {
       const url = String(raw).trim();
       if (!url) return null;
-
-      try {
-        new URL(url);
-      } catch {
-        return { url, valid: false, error: 'Invalid URL format' };
-      }
-
-      try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 10000);
-
-        let headRes = await fetch(url, {
-          method: 'HEAD',
-          redirect: 'follow',
-          signal: controller.signal,
-          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) VidFrame/2.0' },
-        }).catch(() => null);
-        clearTimeout(timeout);
-
-        if (!headRes || (!headRes.ok && headRes.status === 405)) {
-          const getCtrl = new AbortController();
-          const getTimeout = setTimeout(() => getCtrl.abort(), 10000);
-          headRes = await fetch(url, {
-            method: 'GET',
-            headers: {
-              Range: 'bytes=0-1024',
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) VidFrame/2.0',
-            },
-            redirect: 'follow',
-            signal: getCtrl.signal,
-          }).catch(() => null);
-          clearTimeout(getTimeout);
-        }
-
-        if (!headRes || (!headRes.ok && headRes.status !== 206)) {
-          return {
-            url,
-            valid: false,
-            status: headRes?.status || 0,
-            error: `Link returned HTTP ${headRes?.status || 'unreachable'}`,
-          };
-        }
-
-        const contentLength = Number(headRes.headers.get('content-length') || 0);
-        const contentType = headRes.headers.get('content-type') || 'video/mp4';
-
-        let fileName = '';
-        const disposition = headRes.headers.get('content-disposition');
-        if (disposition && disposition.includes('filename=')) {
-          const m = disposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/);
-          if (m && m[1]) fileName = m[1].replace(/['"]/g, '').trim();
-        }
-        if (!fileName) {
-          try {
-            const u = new URL(url);
-            fileName = path.basename(u.pathname);
-          } catch {}
-        }
-        if (!fileName || fileName === '/' || !fileName.includes('.')) {
-          fileName = 'video.mp4';
-        }
-
-        return {
-          url,
-          valid: true,
-          status: headRes.status,
-          contentType,
-          contentLength,
-          fileName,
-        };
-      } catch (err: any) {
-        return {
-          url,
-          valid: false,
-          error: err.message || 'Could not connect to URL',
-        };
-      }
+      return safeProbeMediaUrl(url);
     })
   );
 
   res.json({ success: true, checks: checks.filter(Boolean) });
 });
 
-// Single URL upload endpoint
-apiRouter.post('/media/upload-url', async (req: Request, res: Response) => {
-  const { url, title: userTitle, description: userDesc } = req.body;
+// Single SSRF-Hardened URL upload endpoint
+apiRouter.post('/media/upload-url', requireAuth(['admin', 'editor']), rateLimit('urlImport'), async (req: Request, res: Response) => {
+  const { url, title: userTitle, description: userDesc, visibility = 'public', folder = '' } = req.body;
   if (!url || !String(url).trim()) {
     return res.status(400).json({ error: 'Video download URL is required.' });
   }
@@ -1189,40 +1224,72 @@ apiRouter.post('/media/upload-url', async (req: Request, res: Response) => {
   const tempFilePath = path.join(uploadDir, `url_${Date.now()}_${Math.random().toString(36).substring(7)}.tmp`);
 
   try {
-    const downloaded = await downloadUrlToTempFile(cleanUrl, tempFilePath);
+    const downloaded = await safeDownloadUrlToTempFile(cleanUrl, tempFilePath);
     const title = (userTitle || downloaded.fileName.replace(/\.[^/.]+$/, '')).trim();
-
-    const uploadResult = await telegramService.uploadVideo(
-      tempFilePath,
-      downloaded.fileName,
-      downloaded.mimeType,
-      `VidFrame: ${title}`
-    );
-
+    const sha256Hash = await computeFileSha256(tempFilePath);
+    const duplicateMatch = await findMediaBySha256(sha256Hash).catch(() => null);
+    const adapter = await getStorageAdapter();
     const mediaId = crypto.randomBytes(8).toString('hex');
+
+    let telegramChatId = '';
+    let telegramMessageId = 0;
+    let totalSize = downloaded.size;
+    let duration = 0;
+
+    if (adapter.mode === 'telegram') {
+      const uploadResult = await telegramService.uploadVideo(
+        tempFilePath,
+        downloaded.fileName,
+        downloaded.mimeType,
+        `VidFrame: ${title}`
+      );
+      telegramChatId = uploadResult.chatId;
+      telegramMessageId = uploadResult.messageId;
+      totalSize = uploadResult.size || downloaded.size;
+      duration = uploadResult.duration || 0;
+    }
+
     const newMedia: MediaRecord = {
       id: mediaId,
       title,
       description: (userDesc || '').trim() || (downloaded.fileName.endsWith('.mkv') ? 'MKV Container' : ''),
       filename: downloaded.fileName,
       mimeType: downloaded.mimeType,
-      size: uploadResult.size || downloaded.size,
-      duration: uploadResult.duration || 0,
-      telegramChatId: uploadResult.chatId,
-      telegramMessageId: uploadResult.messageId,
-      visibility: 'public',
-      processingStatus: 'ready',
+      size: totalSize,
+      duration,
+      telegramChatId,
+      telegramMessageId,
+      visibility: ['public', 'unlisted', 'private'].includes(visibility) ? visibility : 'public',
+      folder: folder ? String(folder).trim() : undefined,
+      processingStatus: 'processing',
+      playbackMode: 'legacy_telegram',
+      storageBackend: adapter.mode,
+      sha256Hash,
+      ownerId: req.authCtx?.uid,
       views: 0,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
 
     await saveMediaItem(newMedia);
-    await handleMkvPostUpload(tempFilePath, newMedia);
-    res.json({ success: true, media: newMedia });
+    await stageUploadVersionAndQueueHls(tempFilePath, newMedia, req.authCtx!.uid, adapter.mode);
+    if (adapter.mode === 's3_r2' || adapter.mode === 'local_dev') {
+      const latest = await getMediaItem(mediaId);
+      if (latest?.activeVersionId) {
+        const ext = path.extname(downloaded.fileName) || '.mp4';
+        await adapter.putFile(`media/${mediaId}/${latest.activeVersionId}/master_source${ext}`, tempFilePath, downloaded.mimeType);
+      }
+    }
+
+    await recordAudit(req, 'media.url_imported', 'media', mediaId, { sourceUrl: cleanUrl, backend: adapter.mode });
+    res.json({
+      success: true,
+      media: (await getMediaItem(mediaId)) || newMedia,
+      duplicateWarning: duplicateMatch ? { id: duplicateMatch.id, title: duplicateMatch.title } : null,
+    });
   } catch (err: any) {
     console.error('URL upload failed:', err);
-    res.status(500).json({ error: err.message || 'Failed to download and upload video from URL.' });
+    res.status(400).json({ error: err.message || 'Failed to download and upload video from URL.' });
   } finally {
     if (fs.existsSync(tempFilePath)) {
       try { fs.unlinkSync(tempFilePath); } catch {}
@@ -1230,9 +1297,9 @@ apiRouter.post('/media/upload-url', async (req: Request, res: Response) => {
   }
 });
 
-// Bulk URL upload endpoint with memory-efficient streaming
-apiRouter.post('/media/bulk-upload-urls', async (req: Request, res: Response) => {
-  const { urls } = req.body;
+// Bulk SSRF-Hardened URL upload endpoint
+apiRouter.post('/media/bulk-upload-urls', requireAuth(['admin', 'editor']), rateLimit('urlImport'), async (req: Request, res: Response) => {
+  const { urls, visibility = 'public', folder = '' } = req.body;
   if (!Array.isArray(urls) || urls.length === 0) {
     return res.status(400).json({ error: 'No URLs provided.' });
   }
@@ -1246,37 +1313,62 @@ apiRouter.post('/media/bulk-upload-urls', async (req: Request, res: Response) =>
 
     const tempFilePath = path.join(uploadDir, `bulk_${Date.now()}_${Math.random().toString(36).substring(7)}.tmp`);
     try {
-      const downloaded = await downloadUrlToTempFile(url, tempFilePath);
+      const downloaded = await safeDownloadUrlToTempFile(url, tempFilePath);
       const videoTitle = downloaded.fileName.replace(/\.[^/.]+$/, '');
-
-      const uploadResult = await telegramService.uploadVideo(
-        tempFilePath,
-        downloaded.fileName,
-        downloaded.mimeType,
-        `VidFrame: ${videoTitle}`
-      );
-
+      const sha256Hash = await computeFileSha256(tempFilePath);
+      const adapter = await getStorageAdapter();
       const mediaId = crypto.randomBytes(8).toString('hex');
+
+      let telegramChatId = '';
+      let telegramMessageId = 0;
+      let totalSize = downloaded.size;
+      let duration = 0;
+
+      if (adapter.mode === 'telegram') {
+        const uploadResult = await telegramService.uploadVideo(
+          tempFilePath,
+          downloaded.fileName,
+          downloaded.mimeType,
+          `VidFrame: ${videoTitle}`
+        );
+        telegramChatId = uploadResult.chatId;
+        telegramMessageId = uploadResult.messageId;
+        totalSize = uploadResult.size || downloaded.size;
+        duration = uploadResult.duration || 0;
+      }
+
       const newMedia: MediaRecord = {
         id: mediaId,
         title: videoTitle,
         description: downloaded.fileName.endsWith('.mkv') ? 'MKV Container' : 'Imported via URL',
         filename: downloaded.fileName,
         mimeType: downloaded.mimeType,
-        size: uploadResult.size || downloaded.size,
-        duration: uploadResult.duration || 0,
-        telegramChatId: uploadResult.chatId,
-        telegramMessageId: uploadResult.messageId,
-        visibility: 'public',
-        processingStatus: 'ready',
+        size: totalSize,
+        duration,
+        telegramChatId,
+        telegramMessageId,
+        visibility: ['public', 'unlisted', 'private'].includes(visibility) ? visibility : 'public',
+        folder: folder ? String(folder).trim() : undefined,
+        processingStatus: 'processing',
+        playbackMode: 'legacy_telegram',
+        storageBackend: adapter.mode,
+        sha256Hash,
+        ownerId: req.authCtx?.uid,
         views: 0,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
 
       await saveMediaItem(newMedia);
-      await handleMkvPostUpload(tempFilePath, newMedia);
-      results.push(newMedia);
+      await stageUploadVersionAndQueueHls(tempFilePath, newMedia, req.authCtx!.uid, adapter.mode);
+      if (adapter.mode === 's3_r2' || adapter.mode === 'local_dev') {
+        const latest = await getMediaItem(mediaId);
+        if (latest?.activeVersionId) {
+          const ext = path.extname(downloaded.fileName) || '.mp4';
+          await adapter.putFile(`media/${mediaId}/${latest.activeVersionId}/master_source${ext}`, tempFilePath, downloaded.mimeType);
+        }
+      }
+      results.push((await getMediaItem(mediaId)) || newMedia);
     } catch (err: any) {
       errors.push(`${url}: ${err.message}`);
     } finally {
@@ -1286,10 +1378,11 @@ apiRouter.post('/media/bulk-upload-urls', async (req: Request, res: Response) =>
     }
   }
 
+  await recordAudit(req, 'media.bulk_url_imported', 'media', 'bulk', { count: results.length, errorCount: errors.length });
   res.json({ success: true, media: results, errors });
 });
 
-// Stream media file with range requests (Status 206) - High efficiency for 200-500kbps networks
+// Stream media file with range requests (Status 206) and private token enforcement
 apiRouter.get('/media/:mediaId/stream', async (req: Request, res: Response) => {
   const { mediaId } = req.params;
   const media = await getMediaItem(mediaId);
@@ -1297,6 +1390,17 @@ apiRouter.get('/media/:mediaId/stream', async (req: Request, res: Response) => {
   if (!media) {
     return res.status(404).send('Media not found');
   }
+
+  if (media.visibility === 'private' && !req.authCtx) {
+    const token = typeof req.query.token === 'string' ? req.query.token : '';
+    const check = token && media.activeVersionId ? verifySignedPlaybackToken(token, mediaId, media.activeVersionId) : { valid: false };
+    if (!check.valid) {
+      return res.status(403).json({ error: 'Private media requires authorization or a valid signed token.' });
+    }
+  }
+
+  res.setHeader('Cache-Control', getCdnCacheHeaders(media.visibility, false));
+  res.setHeader('Vary', 'Authorization, Origin');
 
   const isMkv =
     (media.mimeType && media.mimeType.toLowerCase().includes('matroska')) ||
@@ -1566,22 +1670,28 @@ apiRouter.get('/media/:mediaId/tracks', async (req: Request, res: Response) => {
   });
 });
 
-// Serve extracted or on-demand WebVTT subtitle track
+// Serve extracted or on-demand WebVTT subtitle track (with optional live ?offsetMs= sync adjustment)
 apiRouter.get('/media/:mediaId/subtitles/:index.vtt', async (req: Request, res: Response) => {
   const { mediaId, index } = req.params;
   const subIndex = parseInt(index, 10);
+  const offsetMs = Number(req.query.offsetMs || 0);
   const subtitlesDir = path.resolve(process.cwd(), 'public_subtitles');
   if (!fs.existsSync(subtitlesDir)) fs.mkdirSync(subtitlesDir, { recursive: true });
 
-  const subFile = path.join(subtitlesDir, `sub_${mediaId}_${index}.vtt`);
-  if (fs.existsSync(subFile) && fs.statSync(subFile).size > 0) {
+  const sendVtt = (rawText: string) => {
+    const out = offsetMs && !isNaN(offsetMs) ? applyWebVttOffset(rawText, offsetMs) : rawText;
     res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Cache-Control', 'public, max-age=86400');
-    return fs.createReadStream(subFile).pipe(res);
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    return res.send(out);
+  };
+
+  const subFile = path.join(subtitlesDir, `sub_${mediaId}_${index}.vtt`);
+  if (fs.existsSync(subFile) && fs.statSync(subFile).size > 0) {
+    return sendVtt(fs.readFileSync(subFile, 'utf8'));
   }
 
-  // If raw video file is already in stream_cache, extract subtitle in 0.05 seconds
+  // If raw video file is already in stream_cache, extract subtitle immediately
   const rawCacheFile = path.join(streamCacheDir, `raw_${mediaId}.mkv`);
   if (fs.existsSync(rawCacheFile) && fs.statSync(rawCacheFile).size > 0) {
     try {
@@ -1594,10 +1704,7 @@ apiRouter.get('/media/:mediaId/subtitles/:index.vtt', async (req: Request, res: 
         subFile,
       ]);
       if (fs.existsSync(subFile) && fs.statSync(subFile).size > 0) {
-        res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Cache-Control', 'public, max-age=86400');
-        return fs.createReadStream(subFile).pipe(res);
+        return sendVtt(fs.readFileSync(subFile, 'utf8'));
       }
     } catch (e) {
       console.warn('Local subtitle extract warning:', e);
@@ -1613,7 +1720,7 @@ apiRouter.get('/media/:mediaId/subtitles/:index.vtt', async (req: Request, res: 
 
       const chunks: Buffer[] = [];
       let bytesCollected = 0;
-      const subExtractLimit = 20 * 1024 * 1024; // 20 MB
+      const subExtractLimit = 20 * 1024 * 1024;
 
       for await (const chunk of client.iterDownload({
         file: message.media,
@@ -1640,10 +1747,7 @@ apiRouter.get('/media/:mediaId/subtitles/:index.vtt', async (req: Request, res: 
       try { fs.unlinkSync(tempVideo); } catch {}
 
       if (fs.existsSync(subFile) && fs.statSync(subFile).size > 0) {
-        res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Cache-Control', 'public, max-age=86400');
-        return fs.createReadStream(subFile).pipe(res);
+        return sendVtt(fs.readFileSync(subFile, 'utf8'));
       }
     }
   } catch (extractErr) {
@@ -1657,7 +1761,7 @@ apiRouter.get('/media/:mediaId/subtitles/:index.vtt', async (req: Request, res: 
 
 // ================= REAL ANALYTICS API =================
 
-apiRouter.get('/analytics', async (req: Request, res: Response) => {
+apiRouter.get('/analytics', requireAuth(['admin', 'editor']), async (req: Request, res: Response) => {
   try {
     const mediaId = (req.query.mediaId as string) || 'all';
     const events = await getAnalyticsEvents(mediaId);
@@ -1781,14 +1885,7 @@ apiRouter.post('/analytics/view', async (req: Request, res: Response) => {
     };
 
     await recordViewEvent(event);
-
-    // Increment media view count
-    try {
-      const media = await getMediaItem(mediaId);
-      if (media) {
-        await updateMediaItem(mediaId, { views: (media.views || 0) + 1 });
-      }
-    } catch {}
+    await incrementShardedView(mediaId).catch(() => {});
 
     res.json({ success: true, event });
   } catch (error: any) {
@@ -1799,7 +1896,7 @@ apiRouter.post('/analytics/view', async (req: Request, res: Response) => {
 
 // ================= ISSUE REPORTS API =================
 
-apiRouter.get('/reports', async (_req: Request, res: Response) => {
+apiRouter.get('/reports', requireAuth(['admin', 'editor']), async (_req: Request, res: Response) => {
   try {
     const reports = await getReports();
     res.json(reports);
@@ -1808,7 +1905,7 @@ apiRouter.get('/reports', async (_req: Request, res: Response) => {
   }
 });
 
-apiRouter.post('/reports', async (req: Request, res: Response) => {
+apiRouter.post('/reports', rateLimit('general'), async (req: Request, res: Response) => {
   try {
     const { mediaId, mediaTitle, issueType, description } = req.body;
     if (!issueType) {
@@ -1833,7 +1930,7 @@ apiRouter.post('/reports', async (req: Request, res: Response) => {
   }
 });
 
-apiRouter.put('/reports/:id', async (req: Request, res: Response) => {
+apiRouter.put('/reports/:id', requireAuth(['admin', 'editor']), async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const { status } = req.body;
@@ -1841,16 +1938,18 @@ apiRouter.put('/reports/:id', async (req: Request, res: Response) => {
     if (!updated) {
       return res.status(404).json({ error: 'Report not found' });
     }
+    await recordAudit(req, 'report.updated', 'reports', id, { status });
     res.json({ success: true, report: updated });
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to update report' });
   }
 });
 
-apiRouter.delete('/reports/:id', async (req: Request, res: Response) => {
+apiRouter.delete('/reports/:id', requireAuth(['admin', 'editor']), async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     await deleteReport(id);
+    await recordAudit(req, 'report.deleted', 'reports', id);
     res.json({ success: true, message: 'Report deleted.' });
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to delete report' });
@@ -1859,7 +1958,7 @@ apiRouter.delete('/reports/:id', async (req: Request, res: Response) => {
 
 // ================= SERIES & PROJECTS (IDDB / TMDB / MAL / AniList) =================
 
-apiRouter.get('/series', async (_req: Request, res: Response) => {
+apiRouter.get('/series', requireAuth(['admin', 'editor']), async (_req: Request, res: Response) => {
   try {
     const items = await getSeriesItems();
     res.json(items);
@@ -1881,7 +1980,7 @@ apiRouter.get('/series/:id', async (req: Request, res: Response) => {
   }
 });
 
-apiRouter.post('/series', async (req: Request, res: Response) => {
+apiRouter.post('/series', requireAuth(['admin', 'editor']), async (req: Request, res: Response) => {
   try {
     const data: SeriesRecord = req.body;
     if (!data.id || !data.title) {
@@ -1891,13 +1990,14 @@ apiRouter.post('/series', async (req: Request, res: Response) => {
     data.updatedAt = new Date().toISOString();
     data.seasons = data.seasons || [];
     await saveSeriesItem(data);
+    await recordAudit(req, 'series.saved', 'series', data.id, { title: data.title });
     res.json({ success: true, series: data });
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to save series' });
   }
 });
 
-apiRouter.put('/series/:id', async (req: Request, res: Response) => {
+apiRouter.put('/series/:id', requireAuth(['admin', 'editor']), async (req: Request, res: Response) => {
   try {
     const id = decodeURIComponent(req.params.id);
     const existing = await getSeriesItem(id);
@@ -1911,16 +2011,18 @@ apiRouter.put('/series/:id', async (req: Request, res: Response) => {
       updatedAt: new Date().toISOString(),
     };
     await saveSeriesItem(updated);
+    await recordAudit(req, 'series.updated', 'series', id);
     res.json({ success: true, series: updated });
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to update series' });
   }
 });
 
-apiRouter.delete('/series/:id', async (req: Request, res: Response) => {
+apiRouter.delete('/series/:id', requireAuth(['admin', 'editor']), async (req: Request, res: Response) => {
   try {
     const id = decodeURIComponent(req.params.id);
     await deleteSeriesItem(id);
+    await recordAudit(req, 'series.deleted', 'series', id);
     res.json({ success: true, message: 'Series deleted.' });
   } catch (error: any) {
     console.error('Delete series error:', error);
@@ -1929,7 +2031,7 @@ apiRouter.delete('/series/:id', async (req: Request, res: Response) => {
 });
 
 // IDDB Public API Integration (Universal Media Database)
-apiRouter.get('/series/iddb/search', async (req: Request, res: Response) => {
+apiRouter.get('/series/iddb/search', requireAuth(['admin', 'editor']), async (req: Request, res: Response) => {
   const query = (req.query.q as string) || '';
   const type = (req.query.type as string) || 'all';
   if (!query) return res.json([]);
@@ -1944,7 +2046,7 @@ apiRouter.get('/series/iddb/search', async (req: Request, res: Response) => {
   }
 });
 
-apiRouter.get('/series/iddb/media/:id', async (req: Request, res: Response) => {
+apiRouter.get('/series/iddb/media/:id', requireAuth(['admin', 'editor']), async (req: Request, res: Response) => {
   try {
     const response = await fetch(`https://taiddb.ai.studio/api/v1/media/${encodeURIComponent(req.params.id)}`);
     if (!response.ok) throw new Error(`IDDB Media ${req.params.id} not found`);
@@ -1955,7 +2057,7 @@ apiRouter.get('/series/iddb/media/:id', async (req: Request, res: Response) => {
   }
 });
 
-apiRouter.get('/series/iddb/season/:id/:seasonNumber', async (req: Request, res: Response) => {
+apiRouter.get('/series/iddb/season/:id/:seasonNumber', requireAuth(['admin', 'editor']), async (req: Request, res: Response) => {
   try {
     const response = await fetch(`https://taiddb.ai.studio/api/v1/media/${encodeURIComponent(req.params.id)}/season/${req.params.seasonNumber}`);
     if (!response.ok) throw new Error(`Season ${req.params.seasonNumber} not found`);
@@ -1966,7 +2068,7 @@ apiRouter.get('/series/iddb/season/:id/:seasonNumber', async (req: Request, res:
   }
 });
 
-apiRouter.get('/series/iddb/resolve/:provider/:externalId', async (req: Request, res: Response) => {
+apiRouter.get('/series/iddb/resolve/:provider/:externalId', requireAuth(['admin', 'editor']), async (req: Request, res: Response) => {
   try {
     const response = await fetch(`https://taiddb.ai.studio/api/v1/resolve/${req.params.provider}/${encodeURIComponent(req.params.externalId)}`);
     if (!response.ok) throw new Error(`Resolution failed for ${req.params.provider}:${req.params.externalId}`);
@@ -1978,7 +2080,7 @@ apiRouter.get('/series/iddb/resolve/:provider/:externalId', async (req: Request,
 });
 
 // Fetch metadata from IDDB, TMDB, AniList or MAL API proxy
-apiRouter.post('/series/fetch-metadata', async (req: Request, res: Response) => {
+apiRouter.post('/series/fetch-metadata', requireAuth(['admin', 'editor']), async (req: Request, res: Response) => {
   const { source, sourceId } = req.body;
   if (!source || !sourceId) {
     return res.status(400).json({ error: 'Source and sourceId are required.' });

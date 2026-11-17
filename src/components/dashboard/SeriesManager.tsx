@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { SeriesRecord, SeasonItem, EpisodeItem, MediaItem } from '../../types/media';
+import { authFetch } from '../../services/api';
 
 interface SeriesManagerProps {
   mediaItems: MediaItem[];
@@ -32,10 +33,10 @@ export const SeriesManager: React.FC<SeriesManagerProps> = ({ mediaItems, onRefr
   const fetchSeries = async () => {
     setIsLoading(true);
     try {
-      const res = await fetch('/api/series');
+      const res = await authFetch('/api/series');
       const data = await res.json();
-      setSeriesList(data);
-      if (data.length > 0 && !selectedSeries) {
+      setSeriesList(Array.isArray(data) ? data : []);
+      if (Array.isArray(data) && data.length > 0 && !selectedSeries) {
         setSelectedSeries(data[0]);
       }
     } catch (e) {
@@ -78,7 +79,7 @@ export const SeriesManager: React.FC<SeriesManagerProps> = ({ mediaItems, onRefr
       };
 
       try {
-        const res = await fetch('/api/series', {
+        const res = await authFetch('/api/series', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(newSeries),
@@ -104,7 +105,7 @@ export const SeriesManager: React.FC<SeriesManagerProps> = ({ mediaItems, onRefr
     setIsFetching(true);
     setErrorMsg(null);
     try {
-      const res = await fetch('/api/series/fetch-metadata', {
+      const res = await authFetch('/api/series/fetch-metadata', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ source: sourceType, sourceId: sourceIdInput.trim() }),
@@ -112,7 +113,7 @@ export const SeriesManager: React.FC<SeriesManagerProps> = ({ mediaItems, onRefr
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to fetch metadata');
 
-      const savedRes = await fetch('/api/series', {
+      const savedRes = await authFetch('/api/series', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data.series),
@@ -134,7 +135,7 @@ export const SeriesManager: React.FC<SeriesManagerProps> = ({ mediaItems, onRefr
   const executeDeleteSeries = async (project: SeriesRecord) => {
     setIsDeleting(true);
     try {
-      const res = await fetch(`/api/series/${encodeURIComponent(project.id)}`, { method: 'DELETE' });
+      const res = await authFetch(`/api/series/${encodeURIComponent(project.id)}`, { method: 'DELETE' });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.error || 'Failed to delete project');
@@ -173,7 +174,7 @@ export const SeriesManager: React.FC<SeriesManagerProps> = ({ mediaItems, onRefr
     };
 
     try {
-      const res = await fetch(`/api/series/${selectedSeries.id}`, {
+      const res = await authFetch(`/api/series/${selectedSeries.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(updatedSeries),
@@ -184,7 +185,7 @@ export const SeriesManager: React.FC<SeriesManagerProps> = ({ mediaItems, onRefr
         setSeriesList(seriesList.map((s) => (s.id === data.series.id ? data.series : s)));
       }
     } catch (e: any) {
-      alert(e.message || 'Failed to add season');
+      setErrorMsg(e.message || 'Failed to add season');
     }
   };
 
@@ -228,7 +229,7 @@ export const SeriesManager: React.FC<SeriesManagerProps> = ({ mediaItems, onRefr
     };
 
     try {
-      const res = await fetch(`/api/series/${selectedSeries.id}`, {
+      const res = await authFetch(`/api/series/${selectedSeries.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(updatedSeries),
@@ -241,7 +242,7 @@ export const SeriesManager: React.FC<SeriesManagerProps> = ({ mediaItems, onRefr
         setEditingEpisode(null);
       }
     } catch (e: any) {
-      alert(e.message || 'Failed to save episode');
+      setErrorMsg(e.message || 'Failed to save episode');
     }
   };
 

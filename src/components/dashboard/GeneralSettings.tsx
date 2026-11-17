@@ -99,7 +99,15 @@ export const GeneralSettings: React.FC<GeneralSettingsProps> = ({
             </span>
           </div>
           <div className="text-xs text-zinc-400 space-y-1 font-mono text-[11px]">
-            <p>Database ID: <span className="text-zinc-300">ai-studio-5780916b-a4c7-481f-9936-5cd165418cc6</span></p>
+            <p className="break-all">
+              Database ID:{' '}
+              <span className="text-zinc-300">
+                {status?.firestoreDatabaseId || 'ai-studio-vidframe-db50028e-de29-4e0b-b309-1452c83534d0'}
+              </span>
+            </p>
+            <p>
+              Queue Driver: <span className="text-zinc-300">{status?.queueDriver || 'firestore'}</span>
+            </p>
             <p>Security Rules: <span className="text-emerald-400">Deployed & Hardened</span></p>
           </div>
         </div>
@@ -107,30 +115,56 @@ export const GeneralSettings: React.FC<GeneralSettingsProps> = ({
         {/* AES Session Encryption Key */}
         <div className="p-5 bg-zinc-900/50 border border-zinc-800 rounded-2xl space-y-3">
           <div className="flex items-center justify-between">
-            <span className="text-xs font-semibold text-white">AES-256-GCM Session Key</span>
+            <span className="text-xs font-semibold text-white">AES-256-GCM Secret Vault</span>
             <span className="text-[10px] px-2 py-0.5 rounded-full font-mono border bg-emerald-500/10 text-emerald-400 border-emerald-500/30">
               Active ✓
             </span>
           </div>
           <p className="text-[11px] text-zinc-400 leading-relaxed">
-            Telegram StringSession is encrypted with an isolated 256-bit AES key prior to Firestore persistence.
+            Telegram StringSessions and S3/R2 secrets are encrypted with AES-256-GCM before Firestore persistence.
           </p>
         </div>
 
         {/* Administrator Identity */}
         <div className="p-5 bg-zinc-900/50 border border-zinc-800 rounded-2xl space-y-3">
           <div className="flex items-center justify-between">
-            <span className="text-xs font-semibold text-white">Administrator Access</span>
+            <span className="text-xs font-semibold text-white">Authenticated Operator</span>
             <span className="text-[10px] px-2 py-0.5 rounded-full font-mono border bg-emerald-500/10 text-emerald-400 border-emerald-500/30">
-              Authorized ✓
+              {(status?.role || 'admin').toUpperCase()} ✓
             </span>
           </div>
           <div className="text-xs text-zinc-400 space-y-1 font-mono text-[11px]">
-            <p>Admin Email: <span className="text-zinc-300">{status?.adminEmail || 'admin@vidframe.ai'}</span></p>
-            <p>Role: <span className="text-zinc-300">Super Admin / Owner</span></p>
+            <p>Account: <span className="text-zinc-300">{status?.adminEmail || 'Authenticated'}</span></p>
+            <p>Role: <span className="text-zinc-300">{status?.role === 'editor' ? 'Editor (Media & Jobs)' : 'Super Admin / Owner'}</span></p>
           </div>
         </div>
       </div>
+
+      {/* Pluggable AI Providers Readiness */}
+      {status?.aiProviders && status.aiProviders.length > 0 && (
+        <div className="p-5 bg-zinc-900/50 border border-zinc-800 rounded-2xl space-y-3">
+          <h3 className="text-sm font-semibold text-white">AI Transcription & Analysis Adapters</h3>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+            {status.aiProviders.map((prov) => (
+              <div key={prov.id} className="p-3 bg-zinc-950/70 border border-zinc-800 rounded-xl space-y-1">
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-zinc-200">{prov.displayName}</span>
+                  <span
+                    className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${
+                      prov.configured
+                        ? 'text-emerald-400 border-emerald-500/30 bg-emerald-500/10'
+                        : 'text-zinc-400 border-zinc-700 bg-zinc-900'
+                    }`}
+                  >
+                    {prov.configured ? 'Ready' : 'Env Required'}
+                  </span>
+                </div>
+                <p className="text-[11px] text-zinc-500 leading-relaxed">{prov.notes}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Set API Credentials Form */}
       <div className="p-6 bg-zinc-900/60 border border-zinc-800 rounded-2xl space-y-4">

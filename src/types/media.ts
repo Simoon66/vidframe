@@ -1,9 +1,14 @@
+export type StorageBackendMode = 'telegram' | 's3_r2' | 'local_dev';
+
 export interface AudioTrackInfo {
   index: number;
   language?: string;
   title?: string;
   codec?: string;
   channels?: number;
+  isDefault?: boolean;
+  isForced?: boolean;
+  playlistKey?: string;
 }
 
 export interface SubtitleTrackInfo {
@@ -12,6 +17,28 @@ export interface SubtitleTrackInfo {
   title?: string;
   format?: string;
   url?: string;
+  objectKey?: string;
+  isDefault?: boolean;
+  isForced?: boolean;
+  offsetMs?: number;
+  source?: 'embedded' | 'uploaded' | 'ai_transcribed' | 'ai_translated';
+}
+
+export interface ChapterItem {
+  id: string;
+  title: string;
+  startTime: number;
+  endTime?: number;
+}
+
+export interface RenditionInfo {
+  id: string;
+  label: string;
+  width: number;
+  height: number;
+  bandwidth: number;
+  codec: string;
+  playlistKey: string;
 }
 
 export interface MediaItem {
@@ -24,7 +51,7 @@ export interface MediaItem {
   duration?: number;
   telegramChatId: string;
   telegramMessageId: number;
-  telegramMessageIds?: number[]; // For multi-part 2GB+ uploaded files
+  telegramMessageIds?: number[];
   introStart?: number;
   introEnd?: number;
   outroStart?: number;
@@ -34,10 +61,146 @@ export interface MediaItem {
   folder?: string;
   views?: number;
   ownerId?: string;
+  playbackMode?: 'hls_v2' | 'legacy_telegram';
+  storageBackend?: StorageBackendMode;
+  activeVersionId?: string;
+  sha256Hash?: string;
+  allowedDomains?: string[];
+  requireSignedPlayback?: boolean;
+  posterUrl?: string;
+  chapters?: ChapterItem[];
   audioTracks?: AudioTrackInfo[];
   subtitleTracks?: SubtitleTrackInfo[];
   createdAt: string;
   updatedAt: string;
+}
+
+export interface MediaVersionItem {
+  id: string;
+  mediaId: string;
+  versionNumber: number;
+  label: string;
+  filename: string;
+  mimeType: string;
+  size: number;
+  duration: number;
+  sha256Hash: string;
+  storageBackend: StorageBackendMode;
+  objectPrefix: string;
+  masterPlaylistKey?: string;
+  posterKey?: string;
+  renditions: RenditionInfo[];
+  probeMetadata?: {
+    width?: number;
+    height?: number;
+    fps?: number;
+    videoCodec?: string;
+    audioCodec?: string;
+    bitrate?: number;
+  };
+  audioTracks?: AudioTrackInfo[];
+  subtitleTracks?: SubtitleTrackInfo[];
+  status: 'queued' | 'processing' | 'ready' | 'failed';
+  error?: string;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProcessingJobItem {
+  id: string;
+  idempotencyKey: string;
+  queueShard: string;
+  mediaId: string;
+  versionId?: string;
+  jobType: 'transcode_hls' | 'extract_tracks' | 'ai_transcribe' | 'ai_translate' | 'detect_intro' | 'import_url';
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'dead_letter' | 'cancelled';
+  priority: number;
+  attempts: number;
+  maxAttempts: number;
+  checkpoint: string;
+  progressPercent: number;
+  statusMessage?: string;
+  leaseOwner?: string;
+  cancelRequested?: boolean;
+  result?: Record<string, any>;
+  error?: string;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface IntroSuggestionItem {
+  id: string;
+  mediaId: string;
+  introStart: number;
+  introEnd: number;
+  outroStart: number;
+  outroEnd: number;
+  chapters: ChapterItem[];
+  confidenceNote: string;
+  provider: string;
+  status: 'pending' | 'approved' | 'rejected';
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PlaybackDescriptor {
+  media: MediaItem;
+  playbackMode: 'hls_v2' | 'legacy_telegram';
+  hlsManifestUrl?: string;
+  legacyStreamUrl: string;
+  signedToken?: string;
+  posterUrl?: string;
+  renditions: RenditionInfo[];
+  audioTracks: AudioTrackInfo[];
+  subtitleTracks: SubtitleTrackInfo[];
+  chapters: ChapterItem[];
+  versionsCount: number;
+  activeVersionId?: string;
+}
+
+export interface PaginatedMediaResponse {
+  items: MediaItem[];
+  nextCursor: string | null;
+  hasMore: boolean;
+}
+
+export interface AdminUserItem {
+  uid: string;
+  email: string;
+  role: 'admin' | 'editor';
+  active: boolean;
+  displayName?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ApiKeyItem {
+  id: string;
+  name: string;
+  keyPrefix: string;
+  scopes: string[];
+  role: 'admin' | 'editor' | 'playback';
+  ownerUid: string;
+  revokedAt?: string;
+  lastUsedAt?: string;
+  expiresAt?: string;
+  createdAt: string;
+}
+
+export interface AuditLogItem {
+  id: string;
+  actorUid: string;
+  actorEmail: string;
+  actorRole: string;
+  action: string;
+  resourceType: string;
+  resourceId: string;
+  details?: Record<string, any>;
+  ip?: string;
+  createdAt: string;
 }
 
 export interface EpisodeItem {
@@ -56,7 +219,7 @@ export interface SeasonItem {
 }
 
 export interface SeriesRecord {
-  id: string; // e.g. tmdb_12345, anilist_67890, iddb_1, etc.
+  id: string;
   source: 'iddb' | 'tmdb' | 'anilist' | 'mal' | 'custom';
   sourceId: string;
   title: string;
@@ -70,6 +233,13 @@ export interface SeriesRecord {
   updatedAt: string;
 }
 
+export interface TelegramDiagnostic {
+  code: string;
+  message: string;
+  failedAt: string;
+  chatIdTried?: string;
+}
+
 export interface TelegramState {
   state:
     | 'Not Connected'
@@ -81,6 +251,7 @@ export interface TelegramState {
     | 'Login Required'
     | 'Connection Error';
   errorMessage: string | null;
+  lastDiagnostic?: TelegramDiagnostic | null;
   user: {
     id: string;
     username: string | null;
@@ -96,12 +267,29 @@ export interface TelegramState {
 }
 
 export interface StorageConfig {
+  backend?: StorageBackendMode;
   chatId: string;
   chatTitle: string;
   canUpload: boolean;
   canRead: boolean;
+  s3Endpoint?: string;
+  s3Region?: string;
+  s3Bucket?: string;
+  s3AccessKeyId?: string;
+  s3CdnBaseUrl?: string;
+  s3ForcePathStyle?: boolean;
+  s3Configured?: boolean;
+  multiNodeMode?: boolean;
   updatedAt: string;
   configured?: boolean;
+}
+
+export interface AiProviderInfo {
+  id: string;
+  displayName: string;
+  capabilities: string[];
+  configured: boolean;
+  notes: string;
 }
 
 export interface SystemStatus {
@@ -109,6 +297,10 @@ export interface SystemStatus {
   storage: StorageConfig;
   appUrl: string;
   adminEmail: string;
+  role?: 'admin' | 'editor';
+  firestoreDatabaseId?: string;
+  queueDriver?: string;
+  aiProviders?: AiProviderInfo[];
 }
 
 export interface AnalyticsEvent {

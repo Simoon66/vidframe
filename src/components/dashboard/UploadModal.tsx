@@ -80,8 +80,18 @@ export const UploadModal: React.FC<UploadModalProps> = ({
 
   if (!isOpen) return null;
 
+  const activeBackend = storageConfig?.backend || 'telegram';
   const isConnected = telegramState?.state === 'Connected';
-  const isStorageReady = Boolean(storageConfig?.chatId);
+  const isStorageReady =
+    activeBackend === 'local_dev'
+      ? true
+      : activeBackend === 's3_r2'
+      ? Boolean(storageConfig?.s3Configured)
+      : Boolean(storageConfig?.chatId);
+  const canUploadNow =
+    activeBackend === 'local_dev' ||
+    (activeBackend === 's3_r2' && Boolean(storageConfig?.s3Configured)) ||
+    (activeBackend === 'telegram' && isConnected && isStorageReady);
 
   const handleFilesSelected = (filesList: FileList | null) => {
     if (!filesList || filesList.length === 0) return;
@@ -169,13 +179,17 @@ export const UploadModal: React.FC<UploadModalProps> = ({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
-    if (!isConnected) {
-      setErrorMessage('Telegram is not connected. Please connect your Telegram account in Settings.');
+    if (activeBackend === 'telegram' && !isConnected) {
+      setErrorMessage('Telegram is not connected. Please connect Telegram or switch storage adapter in Settings.');
       return;
     }
 
-    if (!isStorageReady) {
-      setErrorMessage('Storage channel is not configured. Please enter a valid Telegram channel ID.');
+    if (!canUploadNow) {
+      setErrorMessage(
+        activeBackend === 's3_r2'
+          ? 'S3 / R2 bucket is not configured yet. Configure credentials in Storage Settings.'
+          : 'Storage channel is not configured. Please enter a valid Telegram channel ID or switch backend.'
+      );
       return;
     }
 
@@ -266,14 +280,20 @@ export const UploadModal: React.FC<UploadModalProps> = ({
           );
 
           uploadedResults.push(res.media);
+          if (res.duplicateWarning) {
+            toast.warning(
+              `Exact SHA-256 content already exists ("${res.duplicateWarning.title}"). Uploaded as a separate media item.`,
+              'Duplicate Content Detected'
+            );
+          }
         }
 
         setIsUploading(false);
         playUploadConfirmationSound();
         toast.success(
           totalFiles === 1
-            ? `Successfully uploaded "${uploadedResults[0].title}"!`
-            : `Successfully uploaded ${uploadedResults.length} videos!`,
+            ? `Successfully uploaded "${uploadedResults[0].title}"! Async HLS packaging queued.`
+            : `Successfully uploaded ${uploadedResults.length} videos! HLS packaging queued.`,
           'Upload Complete'
         );
         onSuccess(totalFiles === 1 ? uploadedResults[0] : uploadedResults);
@@ -323,7 +343,13 @@ export const UploadModal: React.FC<UploadModalProps> = ({
           setOverallProgress(100);
           setIsUploading(false);
           playUploadConfirmationSound();
-          toast.success(`Successfully downloaded and uploaded "${res.media.title}"!`, 'Upload Complete');
+          if (res.duplicateWarning) {
+            toast.warning(
+              `Duplicate SHA-256 detected ("${res.duplicateWarning.title}"). Created new asset anyway.`,
+              'Duplicate Content'
+            );
+          }
+          toast.success(`Successfully imported "${res.media.title}"! HLS packaging queued.`, 'Upload Complete');
           onSuccess(res.media);
           onClose();
         } else {
@@ -416,38 +442,42 @@ export const UploadModal: React.FC<UploadModalProps> = ({
           </div>
         )}
 
-        {/* Telegram configuration warning */}
-        {(!isConnected || !isStorageReady) && (
+        {/* Storage backend readiness warning */}
+        {!canUploadNow && (
           <div className="mb-5 p-4 bg-amber-950/40 border border-amber-500/30 rounded-2xl text-xs space-y-2">
             <p className="text-amber-200 font-semibold flex items-center gap-1.5">
               <span>⚠️</span>
-              <span>Configuration Required Before Uploading</span>
+              <span>Storage Backend Configuration Required ({activeBackend})</span>
             </p>
-            {!isConnected && (
+            {activeBackend === 'telegram' && !isConnected && (
               <div className="flex items-center justify-between pt-1">
-                <span className="text-amber-300/80">Telegram user account not connected.</span>
+                <span className="text-amber-300/80">Telegram account not connected.</span>
                 <button
+                  type="button"
                   onClick={() => {
                     onClose();
                     onGoToTelegram();
                   }}
                   className="px-3 py-1 bg-amber-600/30 hover:bg-amber-600/50 text-amber-200 rounded-lg font-semibold transition cursor-pointer"
                 >
-                  Connect Telegram
+                  Open Settings
                 </button>
               </div>
             )}
-            {isConnected && !isStorageReady && (
+            {((activeBackend === 'telegram' && isConnected && !isStorageReady) || activeBackend === 's3_r2') && (
               <div className="flex items-center justify-between pt-1">
-                <span className="text-amber-300/80">Storage channel ID not set.</span>
+                <span className="text-amber-300/80">
+                  {activeBackend === 's3_r2' ? 'S3 / R2 credentials not verified.' : 'Telegram storage channel ID not set.'}
+                </span>
                 <button
+                  type="button"
                   onClick={() => {
                     onClose();
                     onGoToStorage();
                   }}
                   className="px-3 py-1 bg-amber-600/30 hover:bg-amber-600/50 text-amber-200 rounded-lg font-semibold transition cursor-pointer"
                 >
-                  Configure Channel
+                  Configure Storage
                 </button>
               </div>
             )}
@@ -767,7 +797,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
               {isUploading ? (
                 <>
                   <div className="w-3.5 h-3.5 rounded-full border-2 border-white/30 border-t-white animate-spin" />
-                  <span>Uploading to Telegram...</span>
+                  <span>Processing Upload ({activeBackend})...</span>
                 </>
               ) : (
                 <span>

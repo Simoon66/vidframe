@@ -2,14 +2,14 @@
   "entities": {
     "MediaItem": {
       "title": "MediaItem",
-      "description": "Video media record stored in Telegram with metadata, intro/outro intervals, and playback settings",
+      "description": "Video media asset metadata with storage backend, active HLS version pointer, intro/outro intervals, chapters, and audio/subtitle metadata",
       "type": "object",
       "properties": {
         "id": { "type": "string", "maxLength": 128 },
         "title": { "type": "string", "maxLength": 300 },
         "description": { "type": "string", "maxLength": 5000 },
         "filename": { "type": "string", "maxLength": 300 },
-        "mimeType": { "type": "string", "maxLength": 100 },
+        "mimeType": { "type": "string", "maxLength": 120 },
         "size": { "type": "number" },
         "duration": { "type": "number" },
         "telegramChatId": { "type": "string", "maxLength": 100 },
@@ -20,28 +20,119 @@
         "outroEnd": { "type": "number" },
         "visibility": { "type": "string", "enum": ["public", "unlisted", "private"] },
         "processingStatus": { "type": "string", "enum": ["ready", "processing", "failed"] },
+        "folder": { "type": "string", "maxLength": 120 },
+        "views": { "type": "number" },
         "ownerId": { "type": "string", "maxLength": 128 },
-        "createdAt": { "type": "string", "format": "date-time" },
-        "updatedAt": { "type": "string", "format": "date-time" }
+        "tenantId": { "type": "string", "maxLength": 128 },
+        "tenantShard": { "type": "string", "maxLength": 160 },
+        "timeBucket": { "type": "string", "maxLength": 16 },
+        "playbackMode": { "type": "string", "enum": ["hls_v2", "legacy_telegram"] },
+        "storageBackend": { "type": "string", "enum": ["telegram", "s3_r2", "local_dev"] },
+        "activeVersionId": { "type": "string", "maxLength": 128 },
+        "sha256Hash": { "type": "string", "maxLength": 128 },
+        "requireSignedPlayback": { "type": "boolean" },
+        "posterUrl": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
       },
-      "required": ["id", "title", "filename", "mimeType", "size", "telegramChatId", "telegramMessageId", "visibility", "processingStatus"]
+      "required": ["id", "title", "filename", "mimeType", "size", "visibility", "processingStatus", "createdAt", "updatedAt"]
+    },
+    "MediaVersion": {
+      "title": "MediaVersion",
+      "description": "Immutable master asset version and HLS ABR rendition manifest descriptor",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "mediaId": { "type": "string", "maxLength": 128 },
+        "versionNumber": { "type": "number" },
+        "label": { "type": "string", "maxLength": 120 },
+        "filename": { "type": "string", "maxLength": 300 },
+        "mimeType": { "type": "string", "maxLength": 120 },
+        "size": { "type": "number" },
+        "duration": { "type": "number" },
+        "sha256Hash": { "type": "string", "maxLength": 128 },
+        "storageBackend": { "type": "string", "enum": ["telegram", "s3_r2", "local_dev"] },
+        "objectPrefix": { "type": "string", "maxLength": 300 },
+        "masterPlaylistKey": { "type": "string", "maxLength": 400 },
+        "posterKey": { "type": "string", "maxLength": 400 },
+        "status": { "type": "string", "enum": ["queued", "processing", "ready", "failed"] },
+        "error": { "type": "string", "maxLength": 2000 },
+        "createdBy": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["id", "mediaId", "versionNumber", "storageBackend", "objectPrefix", "status", "createdBy", "createdAt", "updatedAt"]
+    },
+    "ProcessingJob": {
+      "title": "ProcessingJob",
+      "description": "Durable asynchronous media processing job (HLS packaging, AI transcription/translation, intro detection)",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "idempotencyKey": { "type": "string", "maxLength": 200 },
+        "queueShard": { "type": "string", "maxLength": 64 },
+        "mediaId": { "type": "string", "maxLength": 128 },
+        "versionId": { "type": "string", "maxLength": 128 },
+        "jobType": { "type": "string", "enum": ["transcode_hls", "extract_tracks", "ai_transcribe", "ai_translate", "detect_intro", "import_url"] },
+        "status": { "type": "string", "enum": ["queued", "running", "completed", "failed", "dead_letter", "cancelled"] },
+        "priority": { "type": "number" },
+        "attempts": { "type": "number" },
+        "maxAttempts": { "type": "number" },
+        "checkpoint": { "type": "string", "maxLength": 120 },
+        "progressPercent": { "type": "number" },
+        "statusMessage": { "type": "string", "maxLength": 500 },
+        "leaseOwner": { "type": "string", "maxLength": 128 },
+        "cancelRequested": { "type": "boolean" },
+        "error": { "type": "string", "maxLength": 2000 },
+        "createdBy": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["id", "idempotencyKey", "mediaId", "jobType", "status", "attempts", "maxAttempts", "createdBy", "createdAt", "updatedAt"]
+    },
+    "IntroSuggestion": {
+      "title": "IntroSuggestion",
+      "description": "FFmpeg and Gemini suggested intro/outro timestamps and chapter markers awaiting operator approval",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "mediaId": { "type": "string", "maxLength": 128 },
+        "introStart": { "type": "number" },
+        "introEnd": { "type": "number" },
+        "outroStart": { "type": "number" },
+        "outroEnd": { "type": "number" },
+        "confidenceNote": { "type": "string", "maxLength": 1000 },
+        "provider": { "type": "string", "maxLength": 64 },
+        "status": { "type": "string", "enum": ["pending", "approved", "rejected"] },
+        "createdBy": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["id", "mediaId", "status", "provider", "createdBy", "createdAt", "updatedAt"]
     },
     "StorageConfig": {
       "title": "StorageConfig",
-      "description": "Configured Telegram storage channel or group ID and access permissions",
+      "description": "Configured storage backend (Telegram channel, S3/R2 bucket with encrypted secret, or local dev store)",
       "type": "object",
       "properties": {
+        "backend": { "type": "string", "enum": ["telegram", "s3_r2", "local_dev"] },
         "chatId": { "type": "string", "maxLength": 100 },
         "chatTitle": { "type": "string", "maxLength": 200 },
         "canUpload": { "type": "boolean" },
         "canRead": { "type": "boolean" },
-        "updatedAt": { "type": "string", "format": "date-time" }
+        "s3Endpoint": { "type": "string", "maxLength": 400 },
+        "s3Region": { "type": "string", "maxLength": 64 },
+        "s3Bucket": { "type": "string", "maxLength": 128 },
+        "s3AccessKeyId": { "type": "string", "maxLength": 128 },
+        "s3CdnBaseUrl": { "type": "string", "maxLength": 400 },
+        "s3ForcePathStyle": { "type": "boolean" },
+        "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
       },
-      "required": ["chatId"]
+      "required": ["updatedAt"]
     },
     "TelegramSession": {
       "title": "TelegramSession",
-      "description": "Encrypted persistent Telegram MTProto GramJS session data",
+      "description": "AES-256-GCM encrypted persistent Telegram MTProto session and diagnostic state",
       "type": "object",
       "properties": {
         "encryptedSession": { "type": "string", "maxLength": 5000 },
@@ -51,39 +142,188 @@
         "userId": { "type": "string", "maxLength": 100 },
         "username": { "type": "string", "maxLength": 100 },
         "firstName": { "type": "string", "maxLength": 100 },
-        "connectedAt": { "type": "string", "format": "date-time" },
-        "updatedAt": { "type": "string", "format": "date-time" }
+        "sessionStatus": { "type": "string", "enum": ["active", "revoked_or_unregistered"] },
+        "lastAuthError": { "type": "string", "maxLength": 500 },
+        "lastFailedAt": { "type": "string", "maxLength": 64 },
+        "lastChatIdTried": { "type": "string", "maxLength": 100 },
+        "connectedAt": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
       },
-      "required": ["encryptedSession", "iv", "authTag"]
+      "required": ["encryptedSession", "iv", "authTag", "updatedAt"]
     },
     "AdminRecord": {
       "title": "AdminRecord",
-      "description": "Designated administrator identity record",
+      "description": "Role-based access control identity record for administrators and editors",
       "type": "object",
       "properties": {
+        "uid": { "type": "string", "maxLength": 128 },
         "email": { "type": "string", "format": "email", "maxLength": 200 },
-        "role": { "type": "string", "enum": ["admin"] },
-        "createdAt": { "type": "string", "format": "date-time" }
+        "role": { "type": "string", "enum": ["admin", "editor"] },
+        "active": { "type": "boolean" },
+        "displayName": { "type": "string", "maxLength": 120 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
       },
-      "required": ["email", "role"]
+      "required": ["uid", "email", "role", "active", "createdAt", "updatedAt"]
+    },
+    "ApiKey": {
+      "title": "ApiKey",
+      "description": "SHA-256 hashed programmatic API key record with scoped capabilities",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 100 },
+        "keyPrefix": { "type": "string", "maxLength": 40 },
+        "keyHash": { "type": "string", "maxLength": 128 },
+        "role": { "type": "string", "enum": ["admin", "editor", "playback"] },
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "revokedAt": { "type": "string", "maxLength": 64 },
+        "lastUsedAt": { "type": "string", "maxLength": 64 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["id", "name", "keyPrefix", "keyHash", "role", "ownerUid", "createdAt"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Immutable security and operational audit trail entry",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "actorUid": { "type": "string", "maxLength": 128 },
+        "actorEmail": { "type": "string", "maxLength": 200 },
+        "actorRole": { "type": "string", "maxLength": 32 },
+        "action": { "type": "string", "maxLength": 120 },
+        "resourceType": { "type": "string", "maxLength": 64 },
+        "resourceId": { "type": "string", "maxLength": 128 },
+        "ip": { "type": "string", "maxLength": 64 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["id", "actorUid", "action", "resourceType", "resourceId", "createdAt"]
+    },
+    "TelemetrySample": {
+      "title": "TelemetrySample",
+      "description": "Sampled API latency, worker throughput, and client playback telemetry event",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "kind": { "type": "string", "enum": ["api_latency", "playback_error", "playback_buffer", "worker_metric"] },
+        "routeOrMediaId": { "type": "string", "maxLength": 160 },
+        "statusCode": { "type": "number" },
+        "durationMs": { "type": "number" },
+        "detail": { "type": "string", "maxLength": 300 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["id", "kind", "routeOrMediaId", "createdAt"]
+    },
+    "SeriesRecord": {
+      "title": "SeriesRecord",
+      "description": "Episodic series or anime collection mapped to VidFrame media assets",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "source": { "type": "string", "enum": ["iddb", "tmdb", "anilist", "mal", "custom"] },
+        "sourceId": { "type": "string", "maxLength": 128 },
+        "title": { "type": "string", "maxLength": 300 },
+        "description": { "type": "string", "maxLength": 5000 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["id", "source", "sourceId", "title", "createdAt", "updatedAt"]
+    },
+    "AnalyticsEvent": {
+      "title": "AnalyticsEvent",
+      "description": "Playback view analytics event containing sanitized device, OS, browser, and country metadata",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "mediaId": { "type": "string", "maxLength": 128 },
+        "mediaTitle": { "type": "string", "maxLength": 300 },
+        "timestamp": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "country": { "type": "string", "maxLength": 80 },
+        "device": { "type": "string", "enum": ["Mobile", "Desktop", "Tablet", "Other"] },
+        "os": { "type": "string", "enum": ["Windows", "Android", "iOS", "macOS", "Linux", "Other"] },
+        "browser": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["id", "mediaId", "timestamp", "country", "device", "os", "browser"]
+    },
+    "ReportRecord": {
+      "title": "ReportRecord",
+      "description": "Viewer-submitted playback issue report",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "mediaId": { "type": "string", "maxLength": 128 },
+        "mediaTitle": { "type": "string", "maxLength": 300 },
+        "issueType": { "type": "string", "enum": ["Video not playing", "Audio issue", "Subtitle issue", "Buffering or slow playback", "other"] },
+        "description": { "type": "string", "maxLength": 2000 },
+        "status": { "type": "string", "enum": ["open", "investigating", "resolved"] },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["id", "issueType", "status", "createdAt"]
+    },
+    "ViewShard": {
+      "title": "ViewShard",
+      "description": "Write-sharded atomic view counter document for scalable media playback counting",
+      "type": "object",
+      "properties": {
+        "count": { "type": "number" },
+        "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["count", "updatedAt"]
     }
   },
   "firestore": {
     "/media/{mediaId}": {
       "schema": "MediaItem",
-      "description": "Collection of uploaded video media metadata with stream references"
+      "description": "Catalog of uploaded video media metadata with stream, version, and playback descriptors"
     },
-    "/settings/storage": {
+    "/media/{mediaId}/view_shards/{shardId}": {
+      "schema": "ViewShard",
+      "description": "Write-sharded view count accumulators per media item"
+    },
+    "/media_versions/{versionId}": {
+      "schema": "MediaVersion",
+      "description": "Immutable master versions and packaged HLS ABR rendition trees"
+    },
+    "/processing_jobs/{jobId}": {
+      "schema": "ProcessingJob",
+      "description": "Durable asynchronous processing job queue documents with leases and checkpoints"
+    },
+    "/intro_suggestions/{suggestionId}": {
+      "schema": "IntroSuggestion",
+      "description": "AI and FFmpeg proposed intro/outro intervals and video chapters"
+    },
+    "/settings/{settingId}": {
       "schema": "StorageConfig",
-      "description": "Global storage configuration setting pointing to designated Telegram channel"
-    },
-    "/settings/telegram": {
-      "schema": "TelegramSession",
-      "description": "Encrypted server session for Telegram MTProto connection"
+      "description": "Server-managed storage backend and encrypted Telegram session settings"
     },
     "/admins/{adminId}": {
       "schema": "AdminRecord",
-      "description": "List of authorized administrator user IDs"
+      "description": "Authorized RBAC administrators and editors"
+    },
+    "/api_keys/{keyId}": {
+      "schema": "ApiKey",
+      "description": "Hashed programmatic API keys with granular scopes"
+    },
+    "/audit_logs/{logId}": {
+      "schema": "AuditLog",
+      "description": "Immutable operator audit trail"
+    },
+    "/telemetry_metrics/{sampleId}": {
+      "schema": "TelemetrySample",
+      "description": "Sampled operational telemetry and client playback quality metrics"
+    },
+    "/series/{seriesId}": {
+      "schema": "SeriesRecord",
+      "description": "Episodic series and anime collections linked to media IDs"
+    },
+    "/views/{viewId}": {
+      "schema": "AnalyticsEvent",
+      "description": "Playback view analytics events"
+    },
+    "/reports/{reportId}": {
+      "schema": "ReportRecord",
+      "description": "Viewer issue reports and triage statuses"
     }
   }
 }
