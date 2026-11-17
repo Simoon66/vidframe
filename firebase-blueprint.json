@@ -138,6 +138,7 @@
         "encryptedSession": { "type": "string", "maxLength": 5000 },
         "iv": { "type": "string", "maxLength": 100 },
         "authTag": { "type": "string", "maxLength": 100 },
+        "encryptedApiCreds": { "type": "object" },
         "phoneMasked": { "type": "string", "maxLength": 30 },
         "userId": { "type": "string", "maxLength": 100 },
         "username": { "type": "string", "maxLength": 100 },

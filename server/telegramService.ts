@@ -9,12 +9,15 @@ import {
   getSavedTelegramSession,
   saveTelegramSession,
   deleteTelegramSession,
+  getSavedTelegramCredentials,
+  saveTelegramCredentialsDoc,
   getStorageConfig,
   saveStorageConfig,
   StoredTelegramSession,
   StorageConfig,
 } from './db.ts';
-import { encryptSession, decryptSession } from './crypto.ts';
+import { encryptSession, decryptSession, encryptJsonSecret, decryptJsonSecret } from './crypto.ts';
+import { getEffectiveBearerToken } from './firestoreRest.ts';
 import { APP_CONFIG } from './config.ts';
 
 // Fix GramJS MTProtoSender.isConnected and guard un-awaited _reconnect() rejections.
@@ -77,6 +80,7 @@ export interface TelegramDiagnostic {
 const CREDENTIALS_FILE = path.resolve(process.cwd(), '.telegram_credentials.json');
 const LEGACY_PLAINTEXT_SESSION_FILE = path.resolve(process.cwd(), '.telegram_session.dat');
 const ENCRYPTED_SESSION_CACHE_FILE = path.resolve(process.cwd(), '.telegram_session.enc');
+const IDLE_SOCKET_TIMEOUT_MS = 3 * 60 * 1000; // Release TCP socket after 3 min idle to prevent cross-domain AUTH_KEY_DUPLICATED
 
 export function isAuthFatalTelegramError(err: any): boolean {
   const msg = String(err?.errorMessage || err?.message || err || '');
@@ -132,6 +136,11 @@ export class TelegramService {
   private isInitializing = false;
   private initPromise: Promise<void> | null = null;
   private lastKeepaliveWarnAt = 0;
+  private cachedCreds: { apiId: number; apiHash: string } | null = null;
+  private lastRestoreAttemptAt = 0;
+  private lastRestoreAuthToken: string | null = null;
+  private activeOpsCount = 0;
+  private idleTimer: NodeJS.Timeout | null = null;
 
   private constructor() {}
 
@@ -187,16 +196,93 @@ export class TelegramService {
     return client;
   }
 
+  private clearIdleTimer(): void {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+  }
+
+  private scheduleIdleClose(): void {
+    this.clearIdleTimer();
+    if (this.activeOpsCount > 0 || this.state !== 'Connected' || !this.client) return;
+
+    this.idleTimer = setTimeout(async () => {
+      this.idleTimer = null;
+      if (this.activeOpsCount === 0 && !this.isInitializing && !this.pendingAuth && this.state === 'Connected' && this.client) {
+        const idleClient = this.client;
+        this.client = null;
+        await this.safeDestroyClient(idleClient);
+      }
+    }, IDLE_SOCKET_TIMEOUT_MS);
+    if (typeof this.idleTimer.unref === 'function') {
+      this.idleTimer.unref();
+    }
+  }
+
+  private beginOperation(): void {
+    this.activeOpsCount += 1;
+    this.clearIdleTimer();
+  }
+
+  private endOperation(): void {
+    this.activeOpsCount = Math.max(0, this.activeOpsCount - 1);
+    if (this.activeOpsCount === 0 && this.state === 'Connected' && this.client) {
+      this.scheduleIdleClose();
+    }
+  }
+
+  private parseSessionBundleEnv(): { apiId?: number; apiHash?: string; session?: string } | null {
+    const raw = process.env.TELEGRAM_SESSION_BUNDLE?.trim();
+    if (!raw) return null;
+    try {
+      const jsonText = raw.startsWith('{') ? raw : Buffer.from(raw, 'base64').toString('utf8');
+      const parsed = JSON.parse(jsonText);
+      if (parsed && typeof parsed === 'object') {
+        return {
+          apiId: parsed.apiId ? Number(parsed.apiId) : undefined,
+          apiHash: parsed.apiHash ? String(parsed.apiHash).trim() : undefined,
+          session: parsed.session ? String(parsed.session).trim() : undefined,
+        };
+      }
+    } catch {}
+    return null;
+  }
+
+  private writeLocalCredentialsCache(apiId: number, apiHash: string): void {
+    try {
+      fs.writeFileSync(
+        CREDENTIALS_FILE,
+        JSON.stringify({ apiId, apiHash: apiHash.trim(), savedAt: new Date().toISOString() }, null, 2),
+        { encoding: 'utf8', mode: 0o600 }
+      );
+    } catch {}
+  }
+
   public getCredentials(): { apiId: number; apiHash: string; hasCredentials: boolean } {
     let apiId = Number(process.env.TELEGRAM_API_ID);
     let apiHash = process.env.TELEGRAM_API_HASH?.trim() || '';
 
-    if ((!apiId || !apiHash) && !APP_CONFIG.isProduction && fs.existsSync(CREDENTIALS_FILE)) {
+    if (!apiId || !apiHash) {
+      const bundle = this.parseSessionBundleEnv();
+      if (bundle?.apiId && bundle?.apiHash) {
+        apiId = bundle.apiId;
+        apiHash = bundle.apiHash;
+      }
+    }
+
+    if ((!apiId || !apiHash) && this.cachedCreds) {
+      apiId = this.cachedCreds.apiId;
+      apiHash = this.cachedCreds.apiHash;
+    }
+
+    if ((!apiId || !apiHash) && fs.existsSync(CREDENTIALS_FILE)) {
       try {
         const data = JSON.parse(fs.readFileSync(CREDENTIALS_FILE, 'utf8'));
         if (data.apiId && data.apiHash) {
           apiId = Number(data.apiId);
           apiHash = String(data.apiHash).trim();
+          this.cachedCreds = { apiId, apiHash };
         }
       } catch {}
     }
@@ -208,15 +294,61 @@ export class TelegramService {
     };
   }
 
-  public saveCredentials(apiId: number, apiHash: string): void {
-    if (APP_CONFIG.isProduction) {
-      throw new Error('In production, configure TELEGRAM_API_ID and TELEGRAM_API_HASH via Secret Manager/environment.');
+  private async loadCredentialsAsync(): Promise<{ apiId: number; apiHash: string; hasCredentials: boolean }> {
+    const syncCreds = this.getCredentials();
+    if (syncCreds.hasCredentials) {
+      return syncCreds;
     }
-    fs.writeFileSync(
-      CREDENTIALS_FILE,
-      JSON.stringify({ apiId, apiHash: apiHash.trim(), savedAt: new Date().toISOString() }, null, 2),
-      { encoding: 'utf8', mode: 0o600 }
-    );
+
+    // 1. Try Firestore shared settings/telegram_credentials
+    try {
+      const doc = await getSavedTelegramCredentials();
+      if (doc?.ciphertext && doc?.iv && doc?.authTag) {
+        const parsed = decryptJsonSecret<{ apiId: number; apiHash: string }>(doc.ciphertext, doc.iv, doc.authTag);
+        if (parsed?.apiId && parsed?.apiHash) {
+          this.cachedCreds = { apiId: Number(parsed.apiId), apiHash: String(parsed.apiHash).trim() };
+          this.writeLocalCredentialsCache(this.cachedCreds.apiId, this.cachedCreds.apiHash);
+          return { ...this.cachedCreds, hasCredentials: true };
+        }
+      }
+    } catch {}
+
+    // 2. Fallback: Try encryptedApiCreds embedded inside settings/telegram
+    try {
+      const sessionDoc = await getSavedTelegramSession();
+      if (sessionDoc?.encryptedApiCreds?.ciphertext && sessionDoc.encryptedApiCreds.iv && sessionDoc.encryptedApiCreds.authTag) {
+        const parsed = decryptJsonSecret<{ apiId: number; apiHash: string }>(
+          sessionDoc.encryptedApiCreds.ciphertext,
+          sessionDoc.encryptedApiCreds.iv,
+          sessionDoc.encryptedApiCreds.authTag
+        );
+        if (parsed?.apiId && parsed?.apiHash) {
+          this.cachedCreds = { apiId: Number(parsed.apiId), apiHash: String(parsed.apiHash).trim() };
+          this.writeLocalCredentialsCache(this.cachedCreds.apiId, this.cachedCreds.apiHash);
+          return { ...this.cachedCreds, hasCredentials: true };
+        }
+      }
+    } catch {}
+
+    return syncCreds;
+  }
+
+  public async saveCredentials(apiId: number, apiHash: string): Promise<void> {
+    const cleanHash = apiHash.trim();
+    if (!apiId || cleanHash.length < 10) {
+      throw new Error('Valid numeric API ID and API Hash are required.');
+    }
+
+    this.cachedCreds = { apiId, apiHash: cleanHash };
+    this.writeLocalCredentialsCache(apiId, cleanHash);
+
+    const enc = encryptJsonSecret({ apiId, apiHash: cleanHash });
+    await saveTelegramCredentialsDoc({
+      ciphertext: enc.ciphertext,
+      iv: enc.iv,
+      authTag: enc.authTag,
+      updatedAt: new Date().toISOString(),
+    });
   }
 
   public getState() {
@@ -233,15 +365,20 @@ export class TelegramService {
       pendingPhone: this.pendingAuth
         ? this.pendingAuth.phoneNumber.slice(-4).padStart(this.pendingAuth.phoneNumber.length, '*')
         : null,
+      crossDomainSyncEnabled: !APP_CONFIG.isProduction || Boolean(getEffectiveBearerToken() || creds.hasCredentials),
     };
   }
 
-  private writeEncryptedLocalCache(rawSession: string, status: 'active' | 'revoked_or_unregistered' = 'active'): void {
+  private writeEncryptedLocalCache(
+    rawSession: string,
+    status: 'active' | 'revoked_or_unregistered' = 'active',
+    updatedAt = new Date().toISOString()
+  ): void {
     try {
       const enc = encryptSession(rawSession);
       fs.writeFileSync(
         ENCRYPTED_SESSION_CACHE_FILE,
-        JSON.stringify({ ...enc, sessionStatus: status, updatedAt: new Date().toISOString() }),
+        JSON.stringify({ ...enc, sessionStatus: status, updatedAt }),
         { encoding: 'utf8', mode: 0o600 }
       );
       if (fs.existsSync(LEGACY_PLAINTEXT_SESSION_FILE)) {
@@ -252,14 +389,14 @@ export class TelegramService {
     } catch {}
   }
 
-  private readLocalEncryptedOrMigrateLegacy(): { session: string; sessionStatus?: string } | null {
+  private readLocalEncryptedOrMigrateLegacy(): { session: string; sessionStatus?: string; updatedAt?: string } | null {
     // 1. Read encrypted cache if present
     if (fs.existsSync(ENCRYPTED_SESSION_CACHE_FILE)) {
       try {
         const parsed = JSON.parse(fs.readFileSync(ENCRYPTED_SESSION_CACHE_FILE, 'utf8'));
         if (parsed?.encryptedSession && parsed?.iv && parsed?.authTag) {
           const { session } = decryptSession(parsed.encryptedSession, parsed.iv, parsed.authTag);
-          return { session, sessionStatus: parsed.sessionStatus };
+          return { session, sessionStatus: parsed.sessionStatus, updatedAt: parsed.updatedAt };
         }
       } catch (err) {
         console.warn('[TelegramService] Failed to decrypt local encrypted session cache:', err);
@@ -271,8 +408,9 @@ export class TelegramService {
       try {
         const legacyPlain = fs.readFileSync(LEGACY_PLAINTEXT_SESSION_FILE, 'utf8').trim();
         if (legacyPlain && legacyPlain.length > 20) {
-          this.writeEncryptedLocalCache(legacyPlain, 'active');
-          return { session: legacyPlain, sessionStatus: 'active' };
+          const now = new Date().toISOString();
+          this.writeEncryptedLocalCache(legacyPlain, 'active', now);
+          return { session: legacyPlain, sessionStatus: 'active', updatedAt: now };
         }
       } catch {}
     }
@@ -296,6 +434,7 @@ export class TelegramService {
       chatIdTried,
     };
 
+    this.clearIdleTimer();
     if (this.client) {
       const clientToClose = this.client;
       this.client = null;
@@ -330,12 +469,49 @@ export class TelegramService {
     return this.initPromise;
   }
 
+  public async restoreFromFirestoreIfNeeded(): Promise<void> {
+    if (this.initPromise) {
+      await this.initPromise.catch(() => {});
+    }
+
+    const currentToken = getEffectiveBearerToken() || null;
+    const creds = this.getCredentials();
+
+    // If connected and credentials exist, nothing to restore
+    if (this.state === 'Connected' && creds.hasCredentials) {
+      return;
+    }
+
+    // Don't disrupt an active interactive OTP / 2FA login
+    if (this.state === 'Waiting for Code' || this.state === 'Waiting for Two-Step Verification' || this.pendingAuth) {
+      return;
+    }
+
+    const now = Date.now();
+    const tokenChanged = Boolean(currentToken && currentToken !== this.lastRestoreAuthToken);
+    if (!tokenChanged && now - this.lastRestoreAttemptAt < 10000) {
+      return;
+    }
+
+    // Only attempt Firestore sync if we have an active admin token or haven't checked recently
+    if (!currentToken && !creds.hasCredentials) {
+      return;
+    }
+
+    this.lastRestoreAttemptAt = now;
+    if (currentToken) {
+      this.lastRestoreAuthToken = currentToken;
+    }
+
+    await this.init().catch(() => {});
+  }
+
   private async _doInit(): Promise<void> {
     if (this.isInitializing) return;
     this.isInitializing = true;
 
     try {
-      const creds = this.getCredentials();
+      const creds = await this.loadCredentialsAsync();
       if (!creds.hasCredentials) {
         this.state = 'Not Connected';
         this.errorMessage = 'Telegram API ID & API Hash are not configured yet.';
@@ -347,40 +523,53 @@ export class TelegramService {
 
       let decryptedSession = '';
       let storedPhoneMasked: string | null = null;
-      let localStatus: string | undefined;
+      let effectiveStatus: string | undefined;
 
+      const bundleEnv = this.parseSessionBundleEnv();
       const localCache = this.readLocalEncryptedOrMigrateLegacy();
-      if (localCache) {
-        decryptedSession = localCache.session;
-        localStatus = localCache.sessionStatus;
-      }
-
       const stored = await getSavedTelegramSession().catch(() => null);
       if (stored?.phoneMasked) {
         storedPhoneMasked = stored.phoneMasked;
       }
 
-      if (!decryptedSession && stored?.encryptedSession) {
+      let firestoreSession: string | null = null;
+      let firestoreUsedLegacyKey = false;
+      if (stored?.encryptedSession) {
         try {
           const res = decryptSession(stored.encryptedSession, stored.iv, stored.authTag);
-          decryptedSession = res.session;
-          localStatus = stored.sessionStatus;
-          this.writeEncryptedLocalCache(decryptedSession, stored.sessionStatus || 'active');
-
-          // Re-encrypt under current primary key if historical fallback key was used
-          if (res.usedLegacyKey) {
-            const reEnc = encryptSession(decryptedSession);
-            await saveTelegramSession({
-              ...stored,
-              encryptedSession: reEnc.encryptedSession,
-              iv: reEnc.iv,
-              authTag: reEnc.authTag,
-              updatedAt: new Date().toISOString(),
-            }).catch(() => {});
-          }
+          firestoreSession = res.session;
+          firestoreUsedLegacyKey = res.usedLegacyKey;
         } catch (err) {
-          console.error('[TelegramService] Failed to decrypt saved session:', err);
+          console.error('[TelegramService] Failed to decrypt saved Firestore session:', err);
         }
+      }
+
+      if (bundleEnv?.session) {
+        decryptedSession = bundleEnv.session;
+        effectiveStatus = 'active';
+      } else if (firestoreSession) {
+        const localMs = localCache?.updatedAt ? new Date(localCache.updatedAt).getTime() : 0;
+        const remoteMs = stored?.updatedAt ? new Date(stored.updatedAt).getTime() : 0;
+        const remoteSupersedesLocal =
+          !localCache ||
+          (stored?.sessionStatus === 'active' && localCache.sessionStatus !== 'active') ||
+          remoteMs >= localMs;
+
+        if (remoteSupersedesLocal) {
+          decryptedSession = firestoreSession;
+          effectiveStatus = stored?.sessionStatus || 'active';
+          this.writeEncryptedLocalCache(
+            decryptedSession,
+            effectiveStatus === 'revoked_or_unregistered' ? 'revoked_or_unregistered' : 'active',
+            stored?.updatedAt || new Date().toISOString()
+          );
+        } else if (localCache) {
+          decryptedSession = localCache.session;
+          effectiveStatus = localCache.sessionStatus || 'active';
+        }
+      } else if (localCache) {
+        decryptedSession = localCache.session;
+        effectiveStatus = localCache.sessionStatus;
       }
 
       if (!decryptedSession) {
@@ -388,7 +577,7 @@ export class TelegramService {
         return;
       }
 
-      if (stored?.sessionStatus === 'revoked_or_unregistered' || localStatus === 'revoked_or_unregistered') {
+      if (effectiveStatus === 'revoked_or_unregistered') {
         this.state = 'Login Required';
         this.errorMessage =
           stored?.lastAuthError || 'Previous Telegram session was revoked or unregistered. Please re-authorize.';
@@ -399,6 +588,20 @@ export class TelegramService {
           chatIdTried: stored?.lastChatIdTried,
         };
         return;
+      }
+
+      // Migrate legacy/local-key Firestore backup to portable cross-domain encryption when admin auth is present
+      if (stored && firestoreSession && (firestoreUsedLegacyKey || !stored.encryptedApiCreds)) {
+        const reEnc = encryptSession(firestoreSession);
+        const reEncCreds = encryptJsonSecret({ apiId: creds.apiId, apiHash: creds.apiHash });
+        await saveTelegramSession({
+          ...stored,
+          encryptedSession: reEnc.encryptedSession,
+          iv: reEnc.iv,
+          authTag: reEnc.authTag,
+          encryptedApiCreds: reEncCreds,
+          updatedAt: stored.updatedAt || new Date().toISOString(),
+        }).catch(() => {});
       }
 
       if (this.client) {
@@ -430,7 +633,9 @@ export class TelegramService {
             phone: (me as any).phone || storedPhoneMasked || null,
           };
           this.state = 'Connected';
+          this.errorMessage = null;
           this.lastDiagnostic = null;
+          this.scheduleIdleClose();
           console.log(`[TelegramService] Restored session for user: ${this.currentUser.firstName} (${this.currentUser.id})`);
         } else {
           await this.handleAuthFatalFailure(new Error('AUTH_KEY_UNREGISTERED: Saved session is no longer authorized.'));
@@ -468,12 +673,21 @@ export class TelegramService {
     return Boolean(this.client.connected);
   }
 
-  public async reconnect(): Promise<TelegramClient> {
+  public async reconnect(forceFirestoreSync = false): Promise<TelegramClient> {
+    if (forceFirestoreSync) {
+      // Allow recovering if admin completed fresh OTP login on another domain
+      await this.init();
+      if (this.client && this.state === 'Connected') {
+        this.scheduleIdleClose();
+        return this.client;
+      }
+    }
+
     if (this.state === 'Login Required') {
       throw new Error(this.errorMessage || 'Telegram login required before reconnecting.');
     }
 
-    console.log('[TelegramService] Actively reconnecting Telegram client...');
+    console.log('[TelegramService] Reconnecting Telegram client...');
     this.state = 'Reconnecting';
     this.errorMessage = null;
 
@@ -487,6 +701,7 @@ export class TelegramService {
         if (this.isSocketConnected()) {
           this.state = 'Connected';
           this.errorMessage = null;
+          this.scheduleIdleClose();
           return this.client;
         }
       } catch (quickErr: any) {
@@ -501,10 +716,13 @@ export class TelegramService {
     if (!this.client || this.state !== 'Connected') {
       throw new Error(this.errorMessage || 'Telegram client is not connected. Please authorize your Telegram account.');
     }
+    this.scheduleIdleClose();
     return this.client;
   }
 
   public async ensureConnected(maxRetries = 3): Promise<TelegramClient> {
+    await this.restoreFromFirestoreIfNeeded().catch(() => {});
+
     if (this.state === 'Login Required') {
       throw new Error(this.errorMessage || 'Telegram session revoked/unregistered. Please re-authorize in Settings.');
     }
@@ -520,6 +738,7 @@ export class TelegramService {
     }
 
     if (this.client && this.state === 'Connected' && this.isSocketConnected()) {
+      this.scheduleIdleClose();
       return this.client;
     }
 
@@ -547,7 +766,7 @@ export class TelegramService {
   }
 
   public async sendCode(phoneNumber: string): Promise<{ success: boolean; phoneCodeHash?: string; message?: string }> {
-    const creds = this.getCredentials();
+    const creds = await this.loadCredentialsAsync();
     if (!creds.hasCredentials) {
       throw new Error('Please configure TELEGRAM_API_ID and TELEGRAM_API_HASH first.');
     }
@@ -680,27 +899,36 @@ export class TelegramService {
 
     const rawSession = (this.client.session.save() as unknown) as string;
     const encrypted = encryptSession(rawSession);
+    const creds = this.getCredentials();
+    const encryptedApiCreds = creds.hasCredentials
+      ? encryptJsonSecret({ apiId: creds.apiId, apiHash: creds.apiHash })
+      : undefined;
 
     const me = (await withTimeout(this.client.getMe(), 10000, 'Telegram getMe request timed out.')) || user;
     const phoneMasked = this.pendingAuth
       ? this.pendingAuth.phoneNumber.slice(0, 3) + '****' + this.pendingAuth.phoneNumber.slice(-2)
       : undefined;
 
+    const now = new Date().toISOString();
     const storedData: StoredTelegramSession = {
       encryptedSession: encrypted.encryptedSession,
       iv: encrypted.iv,
       authTag: encrypted.authTag,
+      encryptedApiCreds,
       phoneMasked,
       userId: String((me as any).id),
       username: (me as any).username || undefined,
       firstName: (me as any).firstName || '',
       sessionStatus: 'active',
-      connectedAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
+      connectedAt: now,
+      updatedAt: now,
     };
 
     await saveTelegramSession(storedData);
-    this.writeEncryptedLocalCache(rawSession, 'active');
+    if (encryptedApiCreds) {
+      await saveTelegramCredentialsDoc({ ...encryptedApiCreds, updatedAt: now }).catch(() => {});
+    }
+    this.writeEncryptedLocalCache(rawSession, 'active', now);
 
     this.currentUser = {
       id: String((me as any).id),
@@ -714,11 +942,13 @@ export class TelegramService {
     this.errorMessage = null;
     this.lastDiagnostic = null;
     this.pendingAuth = null;
+    this.scheduleIdleClose();
     return { success: true };
   }
 
   // Explicit admin disconnect only
   public async disconnect(): Promise<void> {
+    this.clearIdleTimer();
     try {
       if (this.client) {
         const oldClient = this.client;
@@ -743,125 +973,135 @@ export class TelegramService {
   public async resolveTargetChat(
     chatIdInput: string
   ): Promise<{ entity: any; inputEntity: any; title: string; trueId: string }> {
-    const rawTarget = chatIdInput.trim();
-    const candidates = normalizeChatIdCandidates(rawTarget);
-    const normalizedNumber = rawTarget.replace(/^-100/, '').replace(/^-/, '');
-    const isNumeric = /^\d+$/.test(normalizedNumber);
-    const targetUsername = rawTarget.replace(/^@/, '').toLowerCase();
+    this.beginOperation();
+    try {
+      const rawTarget = chatIdInput.trim();
+      const candidates = normalizeChatIdCandidates(rawTarget);
+      const normalizedNumber = rawTarget.replace(/^-100/, '').replace(/^-/, '');
+      const isNumeric = /^\d+$/.test(normalizedNumber);
+      const targetUsername = rawTarget.replace(/^@/, '').toLowerCase();
 
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        const client = await this.ensureConnected();
-
-        // 1. Search dialogs first to populate accessHash cache cleanly
+      for (let attempt = 1; attempt <= 2; attempt++) {
         try {
-          const dialogs = await withTimeout(
-            client.getDialogs({ limit: 150 }),
-            20000,
-            'Telegram dialogs fetch timed out.'
-          );
+          const client = await this.ensureConnected();
 
-          for (const d of dialogs) {
-            const dId = String(d.id || '');
-            const dCleanId = dId.replace(/^-100/, '').replace(/^-/, '');
-            const entityId = d.entity?.id ? String(d.entity.id) : '';
-            const entityTitle = (d.title || (d.entity as any)?.title || '').trim().toLowerCase();
-            const entityUsername = ((d.entity as any)?.username || '').trim().toLowerCase();
+          // 1. Search dialogs first to populate accessHash cache cleanly
+          try {
+            const dialogs = await withTimeout(
+              client.getDialogs({ limit: 150 }),
+              20000,
+              'Telegram dialogs fetch timed out.'
+            );
 
-            if (
-              candidates.includes(dId) ||
-              (isNumeric && (dCleanId === normalizedNumber || entityId === normalizedNumber)) ||
-              (entityTitle && entityTitle === rawTarget.toLowerCase()) ||
-              (targetUsername && entityUsername === targetUsername)
-            ) {
-              const inputEntity =
-                d.inputEntity ||
-                (d.entity
-                  ? await client.getInputEntity(d.entity)
-                  : d.id
-                  ? await client.getInputEntity(d.id as any)
-                  : null);
-              const title = d.title || (d.entity as any)?.title || rawTarget;
-              return { entity: d.entity, inputEntity, title, trueId: dId };
+            for (const d of dialogs) {
+              const dId = String(d.id || '');
+              const dCleanId = dId.replace(/^-100/, '').replace(/^-/, '');
+              const entityId = d.entity?.id ? String(d.entity.id) : '';
+              const entityTitle = (d.title || (d.entity as any)?.title || '').trim().toLowerCase();
+              const entityUsername = ((d.entity as any)?.username || '').trim().toLowerCase();
+
+              if (
+                candidates.includes(dId) ||
+                (isNumeric && (dCleanId === normalizedNumber || entityId === normalizedNumber)) ||
+                (entityTitle && entityTitle === rawTarget.toLowerCase()) ||
+                (targetUsername && entityUsername === targetUsername)
+              ) {
+                const inputEntity =
+                  d.inputEntity ||
+                  (d.entity
+                    ? await client.getInputEntity(d.entity)
+                    : d.id
+                    ? await client.getInputEntity(d.id as any)
+                    : null);
+                const title = d.title || (d.entity as any)?.title || rawTarget;
+                return { entity: d.entity, inputEntity, title, trueId: dId };
+              }
+            }
+          } catch (dialogErr: any) {
+            if (isAuthFatalTelegramError(dialogErr)) {
+              await this.handleAuthFatalFailure(dialogErr, rawTarget);
+            }
+            if (dialogErr?.message?.includes('Not connected')) {
+              await this.reconnect();
+              continue;
             }
           }
-        } catch (dialogErr: any) {
-          if (isAuthFatalTelegramError(dialogErr)) {
-            await this.handleAuthFatalFailure(dialogErr, rawTarget);
+
+          // 2. Try normalized candidates (-100<id>, -<id>, raw) sequentially without masking 401
+          let lastEntityErr: any = null;
+          for (const candidate of candidates) {
+            try {
+              const entity = await withTimeout(
+                client.getEntity(candidate),
+                15000,
+                'Telegram resolve entity timed out.'
+              );
+              const inputEntity = await client.getInputEntity(entity);
+              return {
+                entity,
+                inputEntity,
+                title: (entity as any).title || (entity as any).username || candidate,
+                trueId: String((entity as any).id ? (candidate.startsWith('-100') ? candidate : (entity as any).id) : candidate),
+              };
+            } catch (entityErr: any) {
+              if (isAuthFatalTelegramError(entityErr)) {
+                await this.handleAuthFatalFailure(entityErr, candidate);
+              }
+              lastEntityErr = entityErr;
+            }
           }
-          if (dialogErr?.message?.includes('Not connected')) {
-            await this.reconnect();
+
+          if (lastEntityErr) throw lastEntityErr;
+        } catch (e: any) {
+          if (isAuthFatalTelegramError(e) || this.state === 'Login Required') {
+            throw e;
+          }
+          console.warn(`[TelegramService] resolveTargetChat attempt ${attempt} error:`, e?.message || e);
+          if (attempt < 2 && (e?.message?.includes('Not connected') || !this.isSocketConnected())) {
+            await this.reconnect().catch(() => {});
             continue;
           }
+          throw new Error(
+            `Could not resolve Telegram destination '${chatIdInput}'. Verify channel membership/admin rights. (${e?.message || 'Unknown error'})`
+          );
         }
-
-        // 2. Try normalized candidates (-100<id>, -<id>, raw) sequentially without masking 401
-        let lastEntityErr: any = null;
-        for (const candidate of candidates) {
-          try {
-            const entity = await withTimeout(
-              client.getEntity(candidate),
-              15000,
-              'Telegram resolve entity timed out.'
-            );
-            const inputEntity = await client.getInputEntity(entity);
-            return {
-              entity,
-              inputEntity,
-              title: (entity as any).title || (entity as any).username || candidate,
-              trueId: String((entity as any).id ? (candidate.startsWith('-100') ? candidate : (entity as any).id) : candidate),
-            };
-          } catch (entityErr: any) {
-            if (isAuthFatalTelegramError(entityErr)) {
-              await this.handleAuthFatalFailure(entityErr, candidate);
-            }
-            lastEntityErr = entityErr;
-          }
-        }
-
-        if (lastEntityErr) throw lastEntityErr;
-      } catch (e: any) {
-        if (isAuthFatalTelegramError(e) || this.state === 'Login Required') {
-          throw e;
-        }
-        console.warn(`[TelegramService] resolveTargetChat attempt ${attempt} error:`, e?.message || e);
-        if (attempt < 2 && (e?.message?.includes('Not connected') || !this.isSocketConnected())) {
-          await this.reconnect().catch(() => {});
-          continue;
-        }
-        throw new Error(
-          `Could not resolve Telegram destination '${chatIdInput}'. Verify channel membership/admin rights. (${e?.message || 'Unknown error'})`
-        );
       }
-    }
 
-    throw new Error(`Could not resolve Telegram destination '${chatIdInput}'.`);
+      throw new Error(`Could not resolve Telegram destination '${chatIdInput}'.`);
+    } finally {
+      this.endOperation();
+    }
   }
 
   public async testStorage(chatIdInput: string): Promise<StorageConfig> {
-    await this.ensureConnected();
-    const { entity, title, trueId } = await this.resolveTargetChat(chatIdInput);
+    this.beginOperation();
+    try {
+      await this.ensureConnected();
+      const { entity, title, trueId } = await this.resolveTargetChat(chatIdInput);
 
-    const canUpload = Boolean(
-      (entity as any).creator ||
-        (entity as any).adminRights?.postMessages ||
-        (entity as any).defaultBannedRights?.sendMessages === false ||
-        true
-    );
+      const canUpload = Boolean(
+        (entity as any).creator ||
+          (entity as any).adminRights?.postMessages ||
+          (entity as any).defaultBannedRights?.sendMessages === false ||
+          true
+      );
 
-    const existing = (await getStorageConfig().catch(() => null)) || ({} as Partial<StorageConfig>);
-    const storageConfig: StorageConfig = {
-      ...existing,
-      backend: 'telegram',
-      chatId: trueId,
-      chatTitle: title,
-      canUpload,
-      canRead: true,
-      updatedAt: new Date().toISOString(),
-    };
+      const existing = (await getStorageConfig().catch(() => null)) || ({} as Partial<StorageConfig>);
+      const storageConfig: StorageConfig = {
+        ...existing,
+        backend: 'telegram',
+        chatId: trueId,
+        chatTitle: title,
+        canUpload,
+        canRead: true,
+        updatedAt: new Date().toISOString(),
+      };
 
-    await saveStorageConfig(storageConfig);
-    return storageConfig;
+      await saveStorageConfig(storageConfig);
+      return storageConfig;
+    } finally {
+      this.endOperation();
+    }
   }
 
   public async uploadVideo(
@@ -871,96 +1111,106 @@ export class TelegramService {
     caption: string,
     progressCallback?: (progress: number) => void
   ): Promise<{ messageId: number; size: number; duration?: number; chatId: string }> {
-    const storage = await getStorageConfig();
-    if (!storage || !storage.chatId) {
-      throw new Error('Telegram storage destination is not configured.');
-    }
+    this.beginOperation();
+    try {
+      const storage = await getStorageConfig();
+      if (!storage || !storage.chatId) {
+        throw new Error('Telegram storage destination is not configured.');
+      }
 
-    const stat = fs.statSync(filePath);
-    const isMkv =
-      fileName.toLowerCase().endsWith('.mkv') ||
-      mimeType.toLowerCase().includes('matroska') ||
-      mimeType.toLowerCase().includes('octet-stream');
+      const stat = fs.statSync(filePath);
+      const isMkv =
+        fileName.toLowerCase().endsWith('.mkv') ||
+        mimeType.toLowerCase().includes('matroska') ||
+        mimeType.toLowerCase().includes('octet-stream');
 
-    let lastError: any = null;
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        const client = await this.ensureConnected();
-        const { inputEntity, trueId } = await this.resolveTargetChat(storage.chatId);
-        const workers = attempt === 1 ? 2 : 1;
+      let lastError: any = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const client = await this.ensureConnected();
+          const { inputEntity, trueId } = await this.resolveTargetChat(storage.chatId);
+          const workers = attempt === 1 ? 2 : 1;
 
-        const result = await withTimeout(
-          client.sendFile(inputEntity, {
-            file: filePath,
-            caption: caption || `VidFrame: ${fileName}`,
-            forceDocument: isMkv ? true : false,
-            workers,
-            progressCallback: (fraction: number) => {
-              if (progressCallback) progressCallback(Math.round(fraction * 100));
-            },
-          }),
-          1800000,
-          'Telegram file upload timed out after 30 minutes.'
-        );
+          const result = await withTimeout(
+            client.sendFile(inputEntity, {
+              file: filePath,
+              caption: caption || `VidFrame: ${fileName}`,
+              forceDocument: isMkv ? true : false,
+              workers,
+              progressCallback: (fraction: number) => {
+                if (progressCallback) progressCallback(Math.round(fraction * 100));
+              },
+            }),
+            1800000,
+            'Telegram file upload timed out after 30 minutes.'
+          );
 
-        return {
-          messageId: result.id,
-          size: stat.size,
-          chatId: trueId,
-          duration: (result.media as any)?.document?.attributes?.find((a: any) => a.duration)?.duration || undefined,
-        };
-      } catch (err: any) {
-        if (isAuthFatalTelegramError(err) || this.state === 'Login Required') {
-          throw err;
-        }
-        lastError = err;
-        const msg = err?.message || String(err);
-        const isNet =
-          msg.includes('Not connected') ||
-          msg.includes('disconnected') ||
-          msg.includes('Connection closed') ||
-          msg.includes('TIMEOUT') ||
-          !this.isSocketConnected();
+          return {
+            messageId: result.id,
+            size: stat.size,
+            chatId: trueId,
+            duration: (result.media as any)?.document?.attributes?.find((a: any) => a.duration)?.duration || undefined,
+          };
+        } catch (err: any) {
+          if (isAuthFatalTelegramError(err) || this.state === 'Login Required') {
+            throw err;
+          }
+          lastError = err;
+          const msg = err?.message || String(err);
+          const isNet =
+            msg.includes('Not connected') ||
+            msg.includes('disconnected') ||
+            msg.includes('Connection closed') ||
+            msg.includes('TIMEOUT') ||
+            !this.isSocketConnected();
 
-        if (attempt < 3 && isNet) {
-          await this.reconnect().catch(() => {});
-          await new Promise((r) => setTimeout(r, 2000 * attempt));
-        } else {
-          break;
+          if (attempt < 3 && isNet) {
+            await this.reconnect().catch(() => {});
+            await new Promise((r) => setTimeout(r, 2000 * attempt));
+          } else {
+            break;
+          }
         }
       }
-    }
 
-    throw lastError || new Error(`Failed to upload ${fileName} to Telegram.`);
+      throw lastError || new Error(`Failed to upload ${fileName} to Telegram.`);
+    } finally {
+      this.endOperation();
+    }
   }
 
   public async getMessageMedia(chatId: string, messageId: number) {
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        const client = await this.ensureConnected();
-        const { inputEntity } = await this.resolveTargetChat(chatId);
+    this.beginOperation();
+    try {
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          const client = await this.ensureConnected();
+          const { inputEntity } = await this.resolveTargetChat(chatId);
 
-        const messages = await withTimeout(
-          client.getMessages(inputEntity, { ids: [messageId] }),
-          20000,
-          'Telegram fetch message timed out.'
-        );
-        if (!messages || messages.length === 0 || !messages[0].media) {
-          throw new Error(`Media not found for Telegram message ID ${messageId}`);
-        }
-        return messages[0];
-      } catch (err: any) {
-        if (isAuthFatalTelegramError(err) || this.state === 'Login Required') {
+          const messages = await withTimeout(
+            client.getMessages(inputEntity, { ids: [messageId] }),
+            20000,
+            'Telegram fetch message timed out.'
+          );
+          if (!messages || messages.length === 0 || !messages[0].media) {
+            throw new Error(`Media not found for Telegram message ID ${messageId}`);
+          }
+          return messages[0];
+        } catch (err: any) {
+          if (isAuthFatalTelegramError(err) || this.state === 'Login Required') {
+            throw err;
+          }
+          if (attempt < 2 && (err?.message?.includes('TIMEOUT') || err?.message?.includes('Not connected') || !this.isSocketConnected())) {
+            await this.reconnect().catch(() => {});
+            await new Promise((r) => setTimeout(r, 1000));
+            continue;
+          }
           throw err;
         }
-        if (attempt < 2 && (err?.message?.includes('TIMEOUT') || err?.message?.includes('Not connected') || !this.isSocketConnected())) {
-          await this.reconnect().catch(() => {});
-          await new Promise((r) => setTimeout(r, 1000));
-          continue;
-        }
-        throw err;
       }
+      throw new Error(`Media not found for Telegram message ID ${messageId}`);
+    } finally {
+      this.endOperation();
     }
-    throw new Error(`Media not found for Telegram message ID ${messageId}`);
   }
 }

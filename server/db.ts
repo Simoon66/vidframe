@@ -81,8 +81,12 @@ async function getAdminFirestoreIfPermitted(): Promise<AdminFirestore | null> {
   if (adminDbVerified === false) return null;
   if (adminDbVerified === true && adminDbInstance) return adminDbInstance;
 
-  // Only attempt privileged Admin Firestore when explicit credentials exist or in Cloud Run
-  const hasExplicitCreds = Boolean(process.env.FIREBASE_SERVICE_ACCOUNT_JSON || process.env.GOOGLE_APPLICATION_CREDENTIALS);
+  // Attempt privileged Admin Firestore when explicit credentials exist or when deployed on Cloud Run (K_SERVICE)
+  const hasExplicitCreds = Boolean(
+    process.env.FIREBASE_SERVICE_ACCOUNT_JSON ||
+      process.env.GOOGLE_APPLICATION_CREDENTIALS ||
+      process.env.K_SERVICE
+  );
   if (!hasExplicitCreds) {
     adminDbVerified = false;
     return null;
@@ -117,10 +121,18 @@ export function computeShard(key: string, shardCount = 16): number {
 
 // ==================== DOMAIN INTERFACES ====================
 
+export interface StoredTelegramCredentials {
+  ciphertext: string;
+  iv: string;
+  authTag: string;
+  updatedAt: string;
+}
+
 export interface StoredTelegramSession {
   encryptedSession: string;
   iv: string;
   authTag: string;
+  encryptedApiCreds?: { ciphertext: string; iv: string; authTag: string };
   phoneMasked?: string;
   userId?: string;
   username?: string;
@@ -576,6 +588,18 @@ export async function saveTelegramSession(data: StoredTelegramSession): Promise<
 
 export async function deleteTelegramSession(): Promise<void> {
   await docDelete('settings', 'telegram');
+}
+
+export async function getSavedTelegramCredentials(): Promise<StoredTelegramCredentials | null> {
+  try {
+    return await docGet<StoredTelegramCredentials>('settings', 'telegram_credentials', false);
+  } catch {
+    return null;
+  }
+}
+
+export async function saveTelegramCredentialsDoc(data: StoredTelegramCredentials): Promise<void> {
+  await docSet('settings', 'telegram_credentials', data, false);
 }
 
 export async function getStorageConfig(): Promise<StorageConfig | null> {

@@ -5,7 +5,21 @@ import { APP_CONFIG } from './config.ts';
 
 const KEY_FILE = path.resolve(process.cwd(), '.telegram_key');
 
-// Legacy deterministic seed (only used for decrypting historical records during rotation)
+// Deterministic project-bound key derivation so any container/domain sharing firebase-applet-config.json
+// can decrypt the shared Telegram MTProto session & API credentials from Firestore without re-login.
+function getPortableProjectSeed(): string | null {
+  try {
+    const configPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
+    if (fs.existsSync(configPath)) {
+      const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+      if (config.projectId && config.appId) {
+        return `${config.projectId}:${config.appId}:${config.firestoreDatabaseId || '(default)'}:${config.apiKey || ''}:vidframe-portable-mtproto-v2`;
+      }
+    }
+  } catch {}
+  return null;
+}
+
 function getLegacyDeterministicSeed(): string {
   try {
     const configPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
@@ -28,6 +42,11 @@ export function getPrimaryEncryptionKey(): Buffer {
     return crypto.createHash('sha256').update(envKey.trim()).digest();
   }
 
+  const portableSeed = getPortableProjectSeed();
+  if (portableSeed) {
+    return crypto.createHmac('sha256', 'vidframe-cross-domain-kdf-v2').update(portableSeed).digest();
+  }
+
   if (fs.existsSync(KEY_FILE)) {
     try {
       const saved = fs.readFileSync(KEY_FILE, 'utf8').trim();
@@ -37,7 +56,6 @@ export function getPrimaryEncryptionKey(): Buffer {
     } catch {}
   }
 
-  // Generate strong random 256-bit local key (do not write static predictable seeds for new secrets in prod)
   if (APP_CONFIG.isProduction) {
     console.warn('[Crypto] TELEGRAM_SESSION_ENCRYPTION_KEY not set in production! Configure Secret Manager.');
   }
@@ -87,6 +105,10 @@ export function decryptSession(encryptedHex: string, ivHex: string, authTagHex: 
   }
 
   // Key-rotation compatibility chain for existing saved Telegram sessions
+  const portableSeed = getPortableProjectSeed();
+  if (portableSeed) {
+    keysToTry.push(crypto.createHmac('sha256', 'vidframe-cross-domain-kdf-v2').update(portableSeed).digest());
+  }
   keysToTry.push(crypto.createHash('sha256').update(getLegacyDeterministicSeed()).digest());
   try {
     const configPath = path.resolve(process.cwd(), 'firebase-applet-config.json');

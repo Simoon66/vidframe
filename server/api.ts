@@ -457,6 +457,7 @@ function getCountryFromReq(req: Request): string {
 
 // 1. Overall System Status (Authenticated Only - Never expose email or secrets unauthenticated)
 apiRouter.get('/status', requireAuth(['admin', 'editor']), async (req: Request, res: Response) => {
+  await telegramService.restoreFromFirestoreIfNeeded().catch(() => {});
   const tgState = telegramService.getState();
   const storage = await getStorageConfig();
   const cfg = getFirebaseConfig();
@@ -486,7 +487,7 @@ apiRouter.post('/telegram/credentials', requireAuth(['admin']), rateLimit('auth'
     return res.status(400).json({ error: 'apiId must be a valid positive integer.' });
   }
 
-  telegramService.saveCredentials(parsedId, String(apiHash).trim());
+  await telegramService.saveCredentials(parsedId, String(apiHash).trim());
   telegramService.init().catch(() => {});
   await recordAudit(req, 'telegram.credentials_saved', 'settings', 'telegram');
 
@@ -501,6 +502,7 @@ apiRouter.post('/telegram/send-code', requireAuth(['admin']), rateLimit('auth'),
   }
 
   try {
+    await telegramService.restoreFromFirestoreIfNeeded().catch(() => {});
     const result = await telegramService.sendCode(phoneNumber);
     res.json(result);
   } catch (error: any) {
@@ -554,7 +556,7 @@ apiRouter.post('/telegram/disconnect', requireAuth(['admin']), async (req: Reque
 // 6b. Telegram Explicit Reconnect & Health Check
 apiRouter.post('/telegram/reconnect', requireAuth(['admin', 'editor']), async (req: Request, res: Response) => {
   try {
-    await telegramService.reconnect();
+    await telegramService.reconnect(true);
     await recordAudit(req, 'telegram.reconnected', 'settings', 'telegram');
     res.json({
       success: true,
@@ -571,6 +573,7 @@ apiRouter.post('/telegram/reconnect', requireAuth(['admin', 'editor']), async (r
 
 // 7. Storage Config (Sanitized)
 apiRouter.get('/storage/config', requireAuth(['admin', 'editor']), async (_req: Request, res: Response) => {
+  await telegramService.restoreFromFirestoreIfNeeded().catch(() => {});
   const config = await getStorageConfig();
   res.json(sanitizeStorageConfigForClient(config));
 });

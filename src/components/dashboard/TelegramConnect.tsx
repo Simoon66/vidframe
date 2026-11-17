@@ -303,10 +303,10 @@ export const TelegramConnect: React.FC<TelegramConnectProps> = ({
           <div className="p-3.5 bg-zinc-950/50 border border-zinc-800/60 rounded-xl text-xs text-zinc-400 space-y-1">
             <div className="flex items-center gap-1.5 text-zinc-300 font-medium">
               <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-              <span>Single Login Persistence Guarantee</span>
+              <span>Cross-Domain Single-Login Persistence</span>
             </div>
             <p className="text-[11px] text-zinc-500 leading-relaxed">
-              Your GramJS MTProto session is encrypted with AES-256-GCM and stored in Firestore. You do not need to re-login on refresh, backend restarts, or redeployments.
+              Both your Telegram API credentials and MTProto session are AES-256-GCM encrypted in Firestore and auto-restore across every domain (dev, preview, custom domains, and container restarts). Idle sockets automatically close after 3 minutes so logging in once never triggers duplicate-session bans.
             </p>
           </div>
 
